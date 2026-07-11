@@ -39,6 +39,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import io.github.sceneview.ExperimentalSceneViewApi
 import io.github.sceneview.SceneView
 import io.github.sceneview.fitDistanceForBounds
 import io.github.sceneview.model.model
@@ -98,6 +99,7 @@ import java.io.File
  * umbrella — its id and `ModelViewerDemo.kt` file are referenced across docs
  * and kept verbatim).
  */
+@OptIn(ExperimentalSceneViewApi::class)
 @Composable
 fun ModelViewerDemo(onBack: () -> Unit) {
     var mode by remember {

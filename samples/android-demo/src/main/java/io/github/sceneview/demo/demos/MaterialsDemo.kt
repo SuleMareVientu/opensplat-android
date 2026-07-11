@@ -30,6 +30,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import io.github.sceneview.ExperimentalSceneViewApi
 import io.github.sceneview.SceneView
 import io.github.sceneview.demo.DemoScaffold
 import io.github.sceneview.demo.ErrorScrim
@@ -77,6 +78,7 @@ import java.io.File
  * through [io.github.sceneview.demo.DeepLinkRouter.DEMO_ID_ALIASES]; the
  * `materials` id itself stays a live registered demo (the natural umbrella).
  */
+@OptIn(ExperimentalSceneViewApi::class)
 @Composable
 fun MaterialsDemo(onBack: () -> Unit) {
     var mode by remember {

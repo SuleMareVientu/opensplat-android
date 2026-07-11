@@ -25,6 +25,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.google.android.filament.LightManager
 import com.google.android.filament.Skybox
+import io.github.sceneview.ExperimentalSceneViewApi
 import io.github.sceneview.RenderQuality
 import io.github.sceneview.SceneView
 import io.github.sceneview.ar.PlacementReticleStyle
@@ -72,6 +73,7 @@ import io.github.sceneview.sample.rememberMaterialInstance
  * - **Ring style** — (reticle mode) switches [PlacementReticleStyle] between RING (modern default)
  *   and DISC (the legacy filled puck).
  */
+@OptIn(ExperimentalSceneViewApi::class)
 @Composable
 fun PlacementReticlePreviewDemo(onBack: () -> Unit) {
     var placed by remember { mutableStateOf(false) }

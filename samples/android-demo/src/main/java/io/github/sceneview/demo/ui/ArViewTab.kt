@@ -42,6 +42,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AddLocationAlt
 import androidx.compose.material.icons.filled.Cached
+import androidx.compose.material.icons.filled.Camera
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Close
@@ -947,6 +948,12 @@ private val FEATURED_AR_DEMOS = listOf(
         titleRes = R.string.featured_ar_face_title,
         subtitleRes = R.string.featured_ar_face_subtitle,
         icon = Icons.Filled.Face,
+    ),
+    FeaturedArDemo(
+        id = "ar-splat-capture",
+        titleRes = R.string.featured_ar_splat_capture_title,
+        subtitleRes = R.string.featured_ar_splat_capture_subtitle,
+        icon = Icons.Filled.Camera,
     ),
     FeaturedArDemo(
         id = "ar-cloud-anchor",

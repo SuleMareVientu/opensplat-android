@@ -53,6 +53,7 @@ import androidx.compose.ui.unit.dp
 import com.google.android.filament.Skybox
 import dev.romainguy.kotlin.math.Float3
 import dev.romainguy.kotlin.math.lookAt
+import io.github.sceneview.ExperimentalSceneViewApi
 import io.github.sceneview.SceneView
 import io.github.sceneview.demo.DemoScaffold
 import io.github.sceneview.demo.DemoSettings
@@ -99,6 +100,7 @@ import kotlin.math.sin
  * camera). Old deep links route through
  * [io.github.sceneview.demo.DeepLinkRouter.DEMO_ID_ALIASES].
  */
+@OptIn(ExperimentalSceneViewApi::class)
 @Composable
 fun TwoDInThreeDDemo(onBack: () -> Unit) {
     var mode by remember {

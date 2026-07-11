@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="demo_ar_splat_capture_title">Splat Capture</string>
+    <string name="demo_ar_splat_capture_subtitle">Extract Nerfstudio-type datasets for Gaussian Splatting</string>
+    <string name="featured_ar_splat_capture_title">Splat Capture</string>
+    <string name="featured_ar_splat_capture_subtitle">Extract 3DGS datasets</string>
+    <string name="ar_splat_capture_start">Start Capture</string>
+    <string name="ar_splat_capture_stop">Stop Capture</string>
+    <string name="ar_splat_capture_export">Export ZIP</string>
+    <string name="ar_splat_capture_frames">Frames: %d</string>
+    <string name="ar_splat_capture_points">Points: %d</string>
+    <string name="ar_splat_capture_status_capturing">Capturing…</string>
+    <string name="ar_splat_capture_status_idle">Ready to capture</string>
+    <string name="ar_splat_capture_lock_focus">Lock Focus</string>
+</resources>

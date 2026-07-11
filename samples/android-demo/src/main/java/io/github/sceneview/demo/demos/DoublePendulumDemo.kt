@@ -23,6 +23,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.google.android.filament.LightManager
+import io.github.sceneview.ExperimentalSceneViewApi
 import io.github.sceneview.SceneView
 import io.github.sceneview.demo.DemoScaffold
 import io.github.sceneview.demo.R
@@ -81,6 +82,7 @@ import kotlin.math.atan2
  * fixing the "ça cible pas bien" framing flagged in
  * [#1481](https://github.com/sceneview/sceneview/issues/1481).
  */
+@OptIn(ExperimentalSceneViewApi::class)
 @Composable
 fun DoublePendulumDemo(onBack: () -> Unit) {
     // --- Tunable simulation parameters (exposed as sliders) ---
