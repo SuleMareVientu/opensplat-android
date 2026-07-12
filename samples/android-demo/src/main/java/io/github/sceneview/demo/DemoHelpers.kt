@@ -537,6 +537,8 @@ class HeroOrbitCameraManipulator(
     private val yHeight: Float,
     private val target: Position,
     private val resumeAfterMillis: Long = 3_000L,
+    private val pinchZoomSpeed: Float = io.github.sceneview.gesture.CameraGestureDetector.DefaultCameraManipulator.DEFAULT_PINCH_ZOOM_SPEED,
+    private val pinchZoomDamping: Float = io.github.sceneview.gesture.CameraGestureDetector.DefaultCameraManipulator.DEFAULT_PINCH_ZOOM_DAMPING,
 ) : io.github.sceneview.gesture.CameraGestureDetector.CameraManipulator {
     private var fallback: io.github.sceneview.gesture.CameraGestureDetector.DefaultCameraManipulator? =
         null
@@ -578,6 +580,8 @@ class HeroOrbitCameraManipulator(
             fallback = io.github.sceneview.gesture.CameraGestureDetector.DefaultCameraManipulator(
                 orbitHomePosition = currentEye(),
                 targetPosition = target,
+                pinchZoomSpeed = pinchZoomSpeed,
+                pinchZoomDamping = pinchZoomDamping,
             ).also { it.setViewport(viewportW, viewportH) }
         }
         // A new gesture is starting — clear the "idle since" stamp so the resume timer
@@ -683,6 +687,8 @@ fun rememberHeroOrbitCameraManipulator(
     staticYaw: Float = 45f,
     target: Position = Position(0f, 0f, 0f),
     resumeAfterMillis: Long = 3_000L,
+    pinchZoomSpeed: Float = io.github.sceneview.gesture.CameraGestureDetector.DefaultCameraManipulator.DEFAULT_PINCH_ZOOM_SPEED,
+    pinchZoomDamping: Float = io.github.sceneview.gesture.CameraGestureDetector.DefaultCameraManipulator.DEFAULT_PINCH_ZOOM_DAMPING,
 ): HeroOrbitCameraManipulator {
     val anim = androidx.compose.runtime.remember { androidx.compose.animation.core.Animatable(0f) }
     androidx.compose.runtime.LaunchedEffect(trigger, DemoSettings.qaMode) {
@@ -704,13 +710,15 @@ fun rememberHeroOrbitCameraManipulator(
     // keeps it a recomposition input; it is also a remember{} key so the manipulator is
     // rebuilt with the new orbit distance if the zoom changes (e.g. a warm-start onNewIntent).
     val effectiveRadius = DemoSettings.cameraDistance ?: radius
-    return androidx.compose.runtime.remember(effectiveRadius, yHeight, target, resumeAfterMillis) {
+    return androidx.compose.runtime.remember(effectiveRadius, yHeight, target, resumeAfterMillis, pinchZoomSpeed, pinchZoomDamping) {
         HeroOrbitCameraManipulator(
             yawProvider = { if (DemoSettings.qaMode) staticYaw else anim.value },
             radius = effectiveRadius,
             yHeight = yHeight,
             target = target,
             resumeAfterMillis = resumeAfterMillis,
+            pinchZoomSpeed = pinchZoomSpeed,
+            pinchZoomDamping = pinchZoomDamping,
         )
     }
 }

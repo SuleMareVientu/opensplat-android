@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="demo_splat_viewer">Splat Viewer</string>
+    <string name="demo_splat_viewer_subtitle">Import and view local 3D Gaussian Splats (.ply or .spz)</string>
+    <string name="demo_splat_viewer_loading">Parsing splat file…</string>
+    <string name="demo_splat_viewer_select_file">Load Splat File</string>
+    <string name="demo_splat_viewer_placeholder">No splat file loaded. Tap below to select a local .ply or .spz file.</string>
+    <string name="demo_splat_viewer_zoom_speed">Pinch Zoom Speed: %s</string>
+</resources>
