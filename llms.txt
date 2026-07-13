@@ -4377,6 +4377,7 @@ by `samples/android-demo/scripts/collate-demos.sh` — never edit between the ma
 ### Content
 
 - `lines-paths` — Lines & Paths. Polylines, helix, grids, and circles.
+- `splat-training` — Splat Training. Train a Gaussian Splat model from a ZIP Nerfstudio dataset.
 - `two-d-in-three-d` — 2D in 3D. Text, image, video, and billboard quads.
 
 ### Interaction

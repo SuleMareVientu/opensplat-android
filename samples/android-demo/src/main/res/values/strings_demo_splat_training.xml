@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="demo_splat_training">Splat Training</string>
+    <string name="demo_splat_training_subtitle">Train a Gaussian Splat model from a ZIP Nerfstudio dataset</string>
+    <string name="demo_splat_training_placeholder">Select a Nerfstudio ZIP project file to begin training.</string>
+    <string name="demo_splat_training_select_file">Select ZIP Dataset</string>
+    <string name="demo_splat_training_iterations">Training Iterations</string>
+    <string name="demo_splat_training_start">Start Training</string>
+    <string name="demo_splat_training_status">Status: %s</string>
+    <string name="demo_splat_training_progress">Iteration %1$d / %2$d</string>
+    <string name="demo_splat_training_psnr">PSNR: %s</string>
+    <string name="demo_splat_training_ssim">SSIM: %s</string>
+    <string name="demo_splat_training_view_result">View Trained Splat</string>
+    <string name="demo_splat_training_loading">Loading dataset…</string>
+</resources>
