@@ -57,6 +57,7 @@ android {
     experimentalProperties["android.nativeLibraryAlignmentPageSize"] = "16k"
 
     compileSdk 36
+    ndkVersion "30.0.14904198"
 
 
     defaultConfig {
@@ -71,6 +72,17 @@ android {
         // The key MUST NEVER be committed — see the resolution block above.
         manifestPlaceholders["arcoreApiKey"] = arcoreApiKey
         buildConfigField "String", "SKETCHFAB_API_KEY", "\"${sketchfabApiKey}\""
+
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++17"
+                arguments "-DANDROID_STL=c++_shared", "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-z,max-page-size=16384"
+            }
+        }
+        
+        ndk {
+            abiFilters "arm64-v8a"
+        }
     }
 
     signingConfigs {
@@ -162,6 +174,14 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+        prefab = true
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('src/main/cpp/CMakeLists.txt')
+            version '3.22.1'
+        }
     }
     androidResources {
         // `.filamat` and `.ktx` are already compressed payloads — re-zipping
@@ -289,6 +309,9 @@ dependencies {
 	
 	// Brush splat training library
 	implementation files('libs/brush-aar-release.aar')
+
+    // LiteRT dependencies for Async AI Depth
+    implementation 'com.google.ai.edge.litert:litert:2.1.6'
 }
 
 // ─── Generated demo registry (issue #1976) ───────────────────────────────
