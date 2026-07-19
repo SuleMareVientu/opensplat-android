@@ -93,6 +93,7 @@ object SplatCapturePipeline {
         width: Int, height: Int,
         depthBuf: java.nio.ByteBuffer, depthWidth: Int, depthHeight: Int,
         confBuf: java.nio.ByteBuffer,
+        pointCloudBuf: java.nio.FloatBuffer, pointCount: Int,
         poseMatrix: FloatArray,
         fx: Float, fy: Float, cx: Float, cy: Float,
         imageFilePath: String, imageRelativePath: String
@@ -138,6 +139,7 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
     }
 
     var isCapturing by remember { mutableStateOf(false) }
+    var warmupFrameCount by remember { mutableIntStateOf(0) }
     var isGenerating by remember { mutableStateOf(false) }
     var isExporting by remember { mutableStateOf(false) }
     var isAutoFocus by remember { mutableStateOf(true) }
@@ -200,6 +202,12 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                 config.focusMode = newMode
                 session.configure(config)
             }
+        }
+    }
+
+    LaunchedEffect(isCapturing) {
+        if (isCapturing) {
+            warmupFrameCount = 0
         }
     }
 
@@ -442,6 +450,11 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                         }
                         
                         if (isCapturing && frame.camera.trackingState == TrackingState.TRACKING && pipelineHandle != 0L) {
+                            if (warmupFrameCount < 60) {
+                                warmupFrameCount++
+                                return@ARSceneView
+                            }
+                            
                             val currentPose = frame.camera.pose
                             val lastPose = captureContext.lastPose
                             
@@ -462,8 +475,11 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                                     cameraImage = frame.cameraImage()
                                     rawDepthImage = frame.acquireRawDepthImage16Bits()
                                     confidenceImage = frame.acquireRawDepthConfidenceImage()
+                                    var pointCloud: com.google.ar.core.PointCloud? = null
                                     
-                                    if (cameraImage != null && rawDepthImage != null && confidenceImage != null) {
+                                    try {
+                                        pointCloud = frame.acquirePointCloud()
+                                        if (cameraImage != null && rawDepthImage != null && confidenceImage != null && pointCloud != null) {
                                         val yPlane = cameraImage.planes[0]
                                         val uPlane = cameraImage.planes[1]
                                         val vPlane = cameraImage.planes[2]
@@ -541,6 +557,7 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                                             cameraImage.width, cameraImage.height,
                                             depthPlane.buffer, rawDepthImage.width, rawDepthImage.height,
                                             confidencePlane.buffer,
+                                            pointCloud.points, pointCloud.points.capacity() / 4,
                                             poseMatrix,
                                             fx_final, fy_final, cx_final, cy_final,
                                             imageFile.absolutePath, imageRelPath
@@ -550,12 +567,16 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                                             internalFrameCount.incrementAndGet()
                                         }
                                     }
-                                } catch (e: Exception) {
-                                } finally {
-                                    cameraImage?.close()
-                                    rawDepthImage?.close()
-                                    confidenceImage?.close()
-                                }
+                                        } catch (e: Exception) {
+                                        } finally {
+                                            pointCloud?.close()
+                                        }
+                                    } catch (e: Exception) {
+                                    } finally {
+                                        cameraImage?.close()
+                                        rawDepthImage?.close()
+                                        confidenceImage?.close()
+                                    }
                             }
                         }
                     }

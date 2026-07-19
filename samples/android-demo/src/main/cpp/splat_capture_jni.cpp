@@ -66,6 +66,7 @@ struct FrameTask {
   int depth_width, depth_height;
 
   std::vector<uint8_t> confidence_data;
+  std::vector<float> slam_points_data;
 
   std::array<float, 16> pose_matrix;
   float fx, fy, cx, cy;
@@ -84,6 +85,7 @@ struct Anchor {
 struct RansacResult {
   float s = 1.0f;
   float t = 0.0f;
+  int best_inliers = 0;
   bool success = false;
 };
 
@@ -131,7 +133,7 @@ public:
     std::vector<Voxel> occupied_voxels;
     for (const auto &pair : voxel_grid_) {
       for (const auto &voxel : pair.second.voxels) {
-        if (voxel.occupied) {
+        if (voxel.occupied && voxel.weight >= 3.0f) {
           occupied_voxels.push_back(voxel);
         }
       }
@@ -240,14 +242,16 @@ public:
   void Clear() {
     std::lock_guard<std::mutex> lock_q(queue_mutex_);
     std::lock_guard<std::mutex> lock_d(data_mutex_);
-    
+
     std::queue<FrameTask> empty_q;
     std::swap(task_queue_, empty_q);
-    
+
     voxel_grid_.clear();
     export_frames_.clear();
     start_compute_ = false;
     total_point_count_.store(0, std::memory_order_relaxed);
+    is_first_frame_ = true;
+    calibration_frames_ = 0;
   }
 
   int GetPendingFramesCount() {
@@ -271,7 +275,8 @@ private:
       return;
     }
 
-    if (LiteRtCreateModelFromFile(env_, model_path_.c_str(), &model_) != kLiteRtStatusOk) {
+    if (LiteRtCreateModelFromFile(env_, model_path_.c_str(), &model_) !=
+        kLiteRtStatusOk) {
       LOGE("Failed to load LiteRT model from path: %s", model_path_.c_str());
       return;
     }
@@ -282,13 +287,17 @@ private:
     }
 
     // Try GPU acceleration first
-    if (LiteRtSetOptionsHardwareAccelerators(options_, kLiteRtHwAcceleratorGpu) == kLiteRtStatusOk) {
-      if (LiteRtCreateCompiledModel(env_, model_, options_, &compiled_model_) == kLiteRtStatusOk) {
+    if (LiteRtSetOptionsHardwareAccelerators(
+            options_, kLiteRtHwAcceleratorGpu) == kLiteRtStatusOk) {
+      if (LiteRtCreateCompiledModel(env_, model_, options_, &compiled_model_) ==
+          kLiteRtStatusOk) {
         bool fully_accelerated = false;
-        LiteRtCompiledModelIsFullyAccelerated(compiled_model_, &fully_accelerated);
+        LiteRtCompiledModelIsFullyAccelerated(compiled_model_,
+                                              &fully_accelerated);
         if (fully_accelerated) {
           is_gpu_enabled_ = 1;
-          LOGI("LiteRT GPU acceleration successfully enabled and fully accelerated.");
+          LOGI("LiteRT GPU acceleration successfully enabled and fully "
+               "accelerated.");
         } else {
           is_gpu_enabled_ = 1;
           LOGI("LiteRT GPU acceleration partially enabled (some ops on CPU).");
@@ -297,12 +306,13 @@ private:
         compiled_model_ = nullptr;
       }
     }
-    
+
     // Fallback to CPU if GPU failed
     if (!compiled_model_) {
       LOGE("Failed to compile with GPU. Falling back to CPU.");
       LiteRtSetOptionsHardwareAccelerators(options_, kLiteRtHwAcceleratorCpu);
-      if (LiteRtCreateCompiledModel(env_, model_, options_, &compiled_model_) != kLiteRtStatusOk) {
+      if (LiteRtCreateCompiledModel(env_, model_, options_, &compiled_model_) !=
+          kLiteRtStatusOk) {
         LOGE("Failed to compile LiteRT model even on CPU.");
         return;
       }
@@ -427,13 +437,15 @@ private:
     // REPLACEMENT FOR STEP 6 & 7: Dynamic Tensor Formatting
     // ---------------------------------------------------------
     LiteRtTensorBufferRequirements input_reqs;
-    if (LiteRtGetCompiledModelInputBufferRequirements(compiled_model_, 0, 0, &input_reqs) != kLiteRtStatusOk) {
+    if (LiteRtGetCompiledModelInputBufferRequirements(
+            compiled_model_, 0, 0, &input_reqs) != kLiteRtStatusOk) {
       LOGE("Failed to get input buffer requirements.");
       return;
     }
 
     LiteRtLayout input_layout;
-    if (LiteRtGetCompiledModelInputTensorLayout(compiled_model_, 0, 0, &input_layout) != kLiteRtStatusOk) {
+    if (LiteRtGetCompiledModelInputTensorLayout(
+            compiled_model_, 0, 0, &input_layout) != kLiteRtStatusOk) {
       LOGE("Failed to get input layout.");
       return;
     }
@@ -467,22 +479,25 @@ private:
     input_tensor_type.element_type = kLiteRtElementTypeFloat32;
     input_tensor_type.layout = input_layout;
 
-    if (LiteRtCreateTensorBufferFromHostMemory(&input_tensor_type, input_tensor.data(),
-                                               input_tensor.size() * sizeof(float), nullptr,
-                                               &input_buffer) != kLiteRtStatusOk) {
+    if (LiteRtCreateTensorBufferFromHostMemory(
+            &input_tensor_type, input_tensor.data(),
+            input_tensor.size() * sizeof(float), nullptr,
+            &input_buffer) != kLiteRtStatusOk) {
       LOGE("Failed to create input tensor buffer.");
       return;
     }
 
     LiteRtTensorBufferRequirements output_reqs;
-    if (LiteRtGetCompiledModelOutputBufferRequirements(compiled_model_, 0, 0, &output_reqs) != kLiteRtStatusOk) {
+    if (LiteRtGetCompiledModelOutputBufferRequirements(
+            compiled_model_, 0, 0, &output_reqs) != kLiteRtStatusOk) {
       LOGE("Failed to get output buffer requirements.");
       LiteRtDestroyTensorBuffer(input_buffer);
       return;
     }
 
     LiteRtLayout output_layout;
-    if (LiteRtGetCompiledModelOutputTensorLayouts(compiled_model_, 0, 1, &output_layout, false) != kLiteRtStatusOk) {
+    if (LiteRtGetCompiledModelOutputTensorLayouts(
+            compiled_model_, 0, 1, &output_layout, false) != kLiteRtStatusOk) {
       LOGE("Failed to get output layout.");
       LiteRtDestroyTensorBuffer(input_buffer);
       return;
@@ -493,21 +508,26 @@ private:
     output_tensor_type.layout = output_layout;
 
     LiteRtTensorBuffer output_buffer = nullptr;
-    if (LiteRtCreateManagedTensorBufferFromRequirements(env_, &output_tensor_type, output_reqs, &output_buffer) != kLiteRtStatusOk) {
+    if (LiteRtCreateManagedTensorBufferFromRequirements(
+            env_, &output_tensor_type, output_reqs, &output_buffer) !=
+        kLiteRtStatusOk) {
       LOGE("Failed to create output tensor buffer.");
       LiteRtDestroyTensorBuffer(input_buffer);
       return;
     }
 
-    if (LiteRtRunCompiledModel(compiled_model_, 0, 1, &input_buffer, 1, &output_buffer) != kLiteRtStatusOk) {
+    if (LiteRtRunCompiledModel(compiled_model_, 0, 1, &input_buffer, 1,
+                               &output_buffer) != kLiteRtStatusOk) {
       LOGE("Inference execution failed.");
       LiteRtDestroyTensorBuffer(input_buffer);
       LiteRtDestroyTensorBuffer(output_buffer);
       return;
     }
 
-    void* output_data_ptr = nullptr;
-    if (LiteRtLockTensorBuffer(output_buffer, &output_data_ptr, kLiteRtTensorBufferLockModeRead) != kLiteRtStatusOk) {
+    void *output_data_ptr = nullptr;
+    if (LiteRtLockTensorBuffer(output_buffer, &output_data_ptr,
+                               kLiteRtTensorBufferLockModeRead) !=
+        kLiteRtStatusOk) {
       LOGE("Failed to lock output buffer.");
       LiteRtDestroyTensorBuffer(input_buffer);
       LiteRtDestroyTensorBuffer(output_buffer);
@@ -516,12 +536,14 @@ private:
 
     std::vector<float> output_ai(896 * 504);
 
-    // LiteRT handles the FP16 to FP32 conversion natively if we created the buffer as Float32.
-    // However, if the underlying buffer exposes FP16 anyway, we need to check its actual type.
+    // LiteRT handles the FP16 to FP32 conversion natively if we created the
+    // buffer as Float32. However, if the underlying buffer exposes FP16 anyway,
+    // we need to check its actual type.
     LiteRtRankedTensorType actual_output_type;
-    if (LiteRtGetTensorBufferTensorType(output_buffer, &actual_output_type) == kLiteRtStatusOk &&
+    if (LiteRtGetTensorBufferTensorType(output_buffer, &actual_output_type) ==
+            kLiteRtStatusOk &&
         actual_output_type.element_type == kLiteRtElementTypeFloat16) {
-      uint16_t* fp16_data = reinterpret_cast<uint16_t*>(output_data_ptr);
+      uint16_t *fp16_data = reinterpret_cast<uint16_t *>(output_data_ptr);
 
       // Fast FP16 to FP32 conversion using standard bit-shifting
       for (int i = 0; i < 896 * 504; ++i) {
@@ -543,7 +565,7 @@ private:
       }
     } else {
       // Standard FP32 extraction
-      float* fp32_data = reinterpret_cast<float*>(output_data_ptr);
+      float *fp32_data = reinterpret_cast<float *>(output_data_ptr);
       std::copy(fp32_data, fp32_data + (896 * 504), output_ai.begin());
     }
 
@@ -555,7 +577,7 @@ private:
     std::vector<float> &z_ai_linear = output_ai;
 
     // 9. C++ 2D Coordinate Mapping (Optical Center Math)
-    std::vector<Anchor> anchors;
+    std::vector<Anchor> tof_anchors;
     int depth_w = task.depth_width;
     int depth_h = task.depth_height;
 
@@ -567,7 +589,7 @@ private:
         int depth_idx = v * depth_w + u;
         uint8_t confidence = task.confidence_data[depth_idx];
 
-        if (confidence >= 240) {
+        if (confidence >= 150) {
           float z_metric = task.depth_data[depth_idx] / 1000.0f;
 
           // Map from center of Depth to center of Landscape Tensor
@@ -583,32 +605,167 @@ private:
 
           if (tx >= 0 && tx < 504 && ty >= 0 && ty < 896) {
             float z_ai_lin = z_ai_linear[ty * 504 + tx];
-            anchors.push_back(Anchor{u_ai, v_ai, z_ai_lin, z_metric});
+            tof_anchors.push_back(Anchor{u_ai, v_ai, z_ai_lin, z_metric});
           }
         }
       }
     }
 
-    // 10. RANSAC Optimization (2-parameter affine model: metric = s * linear_ai
-    // + t)
-    RansacResult ransac = RunRansac(anchors);
-    if (!ransac.success) {
-      LOGI("RANSAC failed: Discarding frame due to lack of anchors or metric "
-           "scale alignment.");
-      return;
+    std::vector<Anchor> slam_anchors;
+    std::array<float, 16> view_mat;
+    const float *m = task.pose_matrix.data();
+    view_mat[0] = m[0];
+    view_mat[4] = m[1];
+    view_mat[8] = m[2];
+    view_mat[12] = -(m[0] * m[12] + m[1] * m[13] + m[2] * m[14]);
+    view_mat[1] = m[4];
+    view_mat[5] = m[5];
+    view_mat[9] = m[6];
+    view_mat[13] = -(m[4] * m[12] + m[5] * m[13] + m[6] * m[14]);
+    view_mat[2] = m[8];
+    view_mat[6] = m[9];
+    view_mat[10] = m[10];
+    view_mat[14] = -(m[8] * m[12] + m[9] * m[13] + m[10] * m[14]);
+    view_mat[3] = 0.f;
+    view_mat[7] = 0.f;
+    view_mat[11] = 0.f;
+    view_mat[15] = 1.0f;
+
+    for (size_t i = 0; i < task.slam_points_data.size(); i += 4) {
+      float x_w = task.slam_points_data[i];
+      float y_w = task.slam_points_data[i + 1];
+      float z_w = task.slam_points_data[i + 2];
+
+      float x_s = view_mat[0] * x_w + view_mat[4] * y_w + view_mat[8] * z_w +
+                  view_mat[12];
+      float y_s = view_mat[1] * x_w + view_mat[5] * y_w + view_mat[9] * z_w +
+                  view_mat[13];
+      float z_s = view_mat[2] * x_w + view_mat[6] * y_w + view_mat[10] * z_w +
+                  view_mat[14];
+
+      float x_p = y_s;
+      float y_p = -x_s;
+      float z_p = z_s;
+
+      float z_true = -z_p;
+      if (z_true <= 0.1f)
+        continue;
+
+      float u_ai = (x_p * task.fx / z_true) + task.cx;
+      float v_ai = task.cy - (y_p * task.fy / z_true);
+
+      int tx = static_cast<int>(std::round(u_ai));
+      int ty = static_cast<int>(std::round(v_ai));
+
+      if (tx >= 0 && tx < 504 && ty >= 0 && ty < 896) {
+        float z_ai_lin = z_ai_linear[ty * 504 + tx];
+        slam_anchors.push_back(Anchor{u_ai, v_ai, z_ai_lin, z_true});
+      }
+    }
+
+    // 10. Global Calibration and Unprojection
+    float s_final, t_final;
+
+    if (calibration_frames_ < 5) {
+      RansacResult ransac = RunRansac(tof_anchors, slam_anchors);
+      if (!ransac.success) {
+        LOGI("RANSAC failed: Discarding frame due to lack of anchors or metric "
+             "scale alignment.");
+        return;
+      }
+
+      if (ransac.best_inliers < 50) {
+        LOGI("Insufficient inliers. Skipping fusion.");
+        return;
+      }
+
+      std::vector<Anchor> inlier_set;
+      for (const auto &a : tof_anchors) {
+        float z_pred = ransac.s * a.z_ai_linear + ransac.t;
+        float tol = std::max(0.05f, a.z_metric * 0.05f);
+        if (std::abs(z_pred - a.z_metric) < tol)
+          inlier_set.push_back(a);
+      }
+
+      float sum_ai = 0, sum_metric = 0, sum_ai2 = 0, sum_ai_metric = 0;
+      for (const auto &a : inlier_set) {
+        sum_ai += a.z_ai_linear;
+        sum_metric += a.z_metric;
+        sum_ai2 += a.z_ai_linear * a.z_ai_linear;
+        sum_ai_metric += a.z_ai_linear * a.z_metric;
+      }
+      int n = inlier_set.size();
+      float denominator = n * sum_ai2 - sum_ai * sum_ai;
+      float s_refit, t_refit;
+      if (denominator > 1e-5f) {
+        s_refit = (n * sum_ai_metric - sum_ai * sum_metric) / denominator;
+        t_refit = (sum_metric - s_refit * sum_ai) / n;
+      } else {
+        s_refit = ransac.s;
+        t_refit = ransac.t;
+      }
+
+      if (is_first_frame_) {
+        smoothed_s_ = s_refit;
+        smoothed_t_ = t_refit;
+        is_first_frame_ = false;
+      } else {
+        if (std::abs(s_refit - smoothed_s_) > 1.5f ||
+            std::abs(t_refit - smoothed_t_) > 1.0f) {
+          LOGI("Temporal outlier rejected during calibration.");
+          return; // Skip this frame
+        }
+        float alpha = 0.2f;
+        smoothed_s_ = (alpha * s_refit) + ((1.0f - alpha) * smoothed_s_);
+        smoothed_t_ = (alpha * t_refit) + ((1.0f - alpha) * smoothed_t_);
+      }
+
+      calibration_frames_++;
+      s_final = smoothed_s_;
+      t_final = smoothed_t_;
+
+      if (calibration_frames_ == 5) {
+        LOGI("Global Calibration locked: s=%f, t=%f", smoothed_s_, smoothed_t_);
+      }
+    } else {
+      s_final = smoothed_s_;
+      t_final = smoothed_t_;
     }
 
     // 11. Densification & Matrix Unprojection and Voxel Fusion
     std::lock_guard<std::mutex> lock(data_mutex_);
 
-    float s = ransac.s;
-    float t = ransac.t;
+    float s = s_final;
+    float t = t_final;
 
     for (int y = 0; y < 896; ++y) {
       for (int x = 0; x < 504; ++x) {
         int tensor_idx = y * 504 + x;
         float z_linear_val = z_ai_linear[tensor_idx];
         float z_true = s * z_linear_val + t;
+
+        // 1. Far-Field Truncation (Skybox Killer)
+        if (z_true < 0.1f || z_true > 3.5f)
+          continue;
+
+        // 2. Edge Discontinuity Guard (Plane Killer)
+        if (x > 0 && x < 503 && y > 0 && y < 895) {
+          float dz_dx = std::abs(z_ai_linear[tensor_idx + 1] -
+                                 z_ai_linear[tensor_idx - 1]);
+          float dz_dy = std::abs(z_ai_linear[tensor_idx + 504] -
+                                 z_ai_linear[tensor_idx - 504]);
+          if (dz_dx > 0.04f * z_linear_val || dz_dy > 0.04f * z_linear_val) {
+            continue;
+          }
+        }
+
+        // 3. Radial Soft-Blending (Seam Minimizer)
+        float nx = (x - task.cx) / task.cx;
+        float ny = (y - task.cy) / task.cy;
+        float r_sq = nx * nx + ny * ny;
+        if (r_sq > 1.0f)
+          continue;
+        float blend_weight = 1.0f - r_sq;
 
         // Unproject into Portrait camera coordinates
         float x_p = (x - task.cx) * z_true / task.fx;
@@ -658,7 +815,8 @@ private:
         float b = rgb_data[tensor_idx * 3 + 2];
 
         if (vx >= 0 && vx < 16 && vy >= 0 && vy < 16 && vz >= 0 && vz < 16) {
-          UpdateVoxel(chunk.voxels[voxel_index], x_w, y_w, z_w, r, g, b, 1.0f);
+          UpdateVoxel(chunk.voxels[voxel_index], x_w, y_w, z_w, r, g, b,
+                      blend_weight);
         }
       }
     }
@@ -672,9 +830,10 @@ private:
          task.image_relative_path.c_str(), export_frames_.size());
   }
 
-  RansacResult RunRansac(const std::vector<Anchor> &anchors) {
+  RansacResult RunRansac(const std::vector<Anchor> &tof_anchors,
+                         const std::vector<Anchor> &slam_anchors) {
     RansacResult result;
-    if (anchors.size() < 2)
+    if (tof_anchors.size() < 2)
       return result;
 
     int best_inliers = -1;
@@ -683,33 +842,47 @@ private:
 
     std::random_device rd;
     std::mt19937 gen(rd());
-    std::uniform_int_distribution<size_t> dist(0, anchors.size() - 1);
+    std::uniform_int_distribution<size_t> dist_tof(0, tof_anchors.size() - 1);
+    std::uniform_int_distribution<size_t> dist_slam(
+        0, slam_anchors.empty() ? 0 : slam_anchors.size() - 1);
 
     for (int iter = 0; iter < 500; ++iter) {
-      size_t idx1 = dist(gen);
-      size_t idx2 = dist(gen);
-      if (idx1 == idx2)
-        continue;
+      size_t idx1 = dist_tof(gen);
+      const auto &a1 = tof_anchors[idx1];
 
-      const auto &a1 = anchors[idx1];
-      const auto &a2 = anchors[idx2];
+      Anchor a2;
+      if (slam_anchors.size() > 5) {
+        size_t idx2 = dist_slam(gen);
+        a2 = slam_anchors[idx2];
+      } else {
+        size_t idx2 = dist_tof(gen);
+        if (idx1 == idx2)
+          continue;
+        a2 = tof_anchors[idx2];
+      }
 
       float diff_ai = a2.z_ai_linear - a1.z_ai_linear;
 
-      // CRITICAL FIX: Lowered from 0.1f to 1e-4f
-      if (std::abs(diff_ai) < 1e-4f)
+      if (std::abs(diff_ai) < 0.05f)
+        continue;
+
+      float u_diff = a1.u_ai - a2.u_ai;
+      float v_diff = a1.v_ai - a2.v_ai;
+      if ((u_diff * u_diff + v_diff * v_diff) < 400.0f)
         continue;
 
       float s = (a2.z_metric - a1.z_metric) / diff_ai;
 
-      // CRITICAL FIX: Explicitly reject negative scales!
-      if (s <= 1e-5f)
+      if (s <= 0.01f || s > 50.0f)
         continue;
 
       float t = a1.z_metric - s * a1.z_ai_linear;
 
+      if (std::abs(t) > 10.0f)
+        continue;
+
       int inliers = 0;
-      for (const auto &a : anchors) {
+      for (const auto &a : tof_anchors) {
         float z_pred = s * a.z_ai_linear + t;
         float tol = std::max(0.05f, a.z_metric * 0.05f);
         if (std::abs(z_pred - a.z_metric) < tol) {
@@ -724,11 +897,14 @@ private:
       }
     }
 
-    if (best_inliers >= 2) {
+    if (best_inliers >
+        std::max(10, static_cast<int>(tof_anchors.size() * 0.05f))) {
       result.s = best_s;
       result.t = best_t;
+      result.best_inliers = best_inliers;
       result.success = true;
     }
+
     return result;
   }
 
@@ -743,9 +919,14 @@ private:
       v.b = b;
       v.weight = weight;
       v.occupied = true;
-      total_point_count_.fetch_add(1, std::memory_order_relaxed);
+      if (v.weight >= 3.0f) {
+        total_point_count_.fetch_add(1, std::memory_order_relaxed);
+      }
     } else {
       float new_weight = v.weight + weight;
+      if (v.weight < 3.0f && new_weight >= 3.0f) {
+        total_point_count_.fetch_add(1, std::memory_order_relaxed);
+      }
       v.x = (v.x * v.weight + x * weight) / new_weight;
       v.y = (v.y * v.weight + y * weight) / new_weight;
       v.z = (v.z * v.weight + z * weight) / new_weight;
@@ -771,6 +952,11 @@ private:
   std::unordered_map<uint64_t, Chunk> voxel_grid_;
   std::atomic<int> total_point_count_{0};
   std::vector<ExportFrame> export_frames_;
+
+  bool is_first_frame_ = true;
+  int calibration_frames_ = 0;
+  float smoothed_s_ = 1.0f;
+  float smoothed_t_ = 0.0f;
 
   // LiteRT
   LiteRtEnvironment env_ = nullptr;
@@ -807,8 +993,9 @@ Java_io_github_sceneview_demo_demos_SplatCapturePipeline_processFrame(
     jobject u_buf, jint u_row_stride, jint u_pixel_stride, jobject v_buf,
     jint v_row_stride, jint v_pixel_stride, jint width, jint height,
     jobject depth_buf, jint depth_width, jint depth_height, jobject conf_buf,
-    jfloatArray pose_matrix, jfloat fx, jfloat fy, jfloat cx, jfloat cy,
-    jstring image_file_path, jstring image_relative_path) {
+    jobject point_cloud_buf, jint point_count, jfloatArray pose_matrix,
+    jfloat fx, jfloat fy, jfloat cx, jfloat cy, jstring image_file_path,
+    jstring image_relative_path) {
   auto *pipeline = reinterpret_cast<SplatCapturePipeline *>(handle);
   if (!pipeline)
     return JNI_FALSE;
@@ -854,6 +1041,13 @@ Java_io_github_sceneview_demo_demos_SplatCapturePipeline_processFrame(
       reinterpret_cast<uint8_t *>(env->GetDirectBufferAddress(conf_buf));
   task.confidence_data.assign(conf_addr,
                               conf_addr + depth_width * depth_height);
+
+  if (point_cloud_buf != nullptr && point_count > 0) {
+    float *point_cloud_addr =
+        reinterpret_cast<float *>(env->GetDirectBufferAddress(point_cloud_buf));
+    task.slam_points_data.assign(point_cloud_addr,
+                                 point_cloud_addr + point_count * 4);
+  }
 
   // Copy Pose Matrix (16 float array)
   jfloat *pose_elements = env->GetFloatArrayElements(pose_matrix, nullptr);
