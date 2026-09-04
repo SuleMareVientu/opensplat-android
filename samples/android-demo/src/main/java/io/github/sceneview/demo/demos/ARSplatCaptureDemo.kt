@@ -99,13 +99,13 @@ object SplatCapturePipeline {
         imageFilePath: String, imageRelativePath: String
     ): Boolean
 
+    external fun processDataset(handle: Long, manifestPath: String)
     external fun getPointCount(handle: Long): Int
-    external fun exportDataset(handle: Long, outputDir: String)
-    external fun startDepthGeneration(handle: Long)
     external fun clearPipeline(handle: Long)
     external fun getPendingFrames(handle: Long): Int
     external fun getProcessedFrames(handle: Long): Int
     external fun getGpuStatus(handle: Long): Int
+    external fun getProcessingPhase(handle: Long): Int
 }
 
 class CaptureContext {
@@ -153,6 +153,13 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
     var processedFrames by remember { mutableIntStateOf(0) }
     var totalFramesToProcess by remember { mutableIntStateOf(0) }
     var gpuStatus by remember { mutableIntStateOf(0) }
+    var processingPhase by remember { mutableIntStateOf(0) }
+    var isExportReady by remember { mutableStateOf(false) }
+
+    // Request Notification permission for Android 13+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) {}
 
     val tempDir = remember {
         File(context.cacheDir, "splat_capture").apply {
@@ -162,14 +169,22 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
         }
     }
 
-    val modelFile = remember { File(context.cacheDir, "da3_small_gpu_fp16.tflite") }
     var pipelineHandle by remember { mutableStateOf(0L) }
     var initError by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) {
             try {
-                copyAssetToFile(context, "models/da3_small_gpu_fp16.tflite", modelFile)
+                // Copy xfeat_fp16.tflite from assets to cache
+                val modelFile = File(context.cacheDir, "xfeat_fp16.tflite")
+                if (!modelFile.exists()) {
+                    context.assets.open("xfeat_fp16.tflite").use { input ->
+                        FileOutputStream(modelFile).use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                }
+                
                 val handle = SplatCapturePipeline.initPipeline(modelFile.absolutePath)
                 if (handle == 0L) {
                     throw RuntimeException("JNI pipeline handle initialization failed.")
@@ -179,14 +194,30 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    initError = "Error loading model or initializing JNI: ${e.message}\nEnsure 'da3_small_gpu_fp16.tflite' exists in your assets/models folder."
+                    initError = "Error initializing JNI: ${e.message}"
                 }
             }
         }
     }
 
     DisposableEffect(Unit) {
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(context: android.content.Context, intent: android.content.Intent) {
+                if (intent.action == "io.github.sceneview.demo.SPLAT_PROCESSING_COMPLETE") {
+                    isGenerating = false
+                    isExportReady = true
+                }
+            }
+        }
+        val filter = android.content.IntentFilter("io.github.sceneview.demo.SPLAT_PROCESSING_COMPLETE")
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            context.registerReceiver(receiver, filter)
+        }
+        
         onDispose {
+            context.unregisterReceiver(receiver)
             if (pipelineHandle != 0L) {
                 SplatCapturePipeline.freePipeline(pipelineHandle)
                 pipelineHandle = 0L
@@ -205,6 +236,18 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
         }
     }
 
+    LaunchedEffect(isGenerating, arSession) {
+        try {
+            if (isGenerating) {
+                arSession?.pause()
+            } else {
+                arSession?.resume()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
     LaunchedEffect(isCapturing) {
         if (isCapturing) {
             warmupFrameCount = 0
@@ -218,10 +261,14 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                 pendingFrames = SplatCapturePipeline.getPendingFrames(pipelineHandle)
                 processedFrames = SplatCapturePipeline.getProcessedFrames(pipelineHandle)
                 gpuStatus = SplatCapturePipeline.getGpuStatus(pipelineHandle)
-                if (isGenerating && pendingFrames == 0) {
+                processingPhase = SplatCapturePipeline.getProcessingPhase(pipelineHandle)
+                
+                if (isGenerating && processingPhase == 6) {
                     isGenerating = false
+                    isExportReady = true
                 }
-                if (!isCapturing) {
+                
+                if (!isCapturing && !isGenerating) {
                     displayPointCount = SplatCapturePipeline.getPointCount(pipelineHandle)
                 } else {
                     displayPointCount = 0
@@ -305,7 +352,8 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.Bottom
             ) {
                 if (isCapturing) {
                     Button(
@@ -322,6 +370,7 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                         onClick = {
                             isCapturing = true
                             isGenerating = false
+                            isExportReady = false
                             internalFrameCount.set(0)
                             displayFrameCount = 0
                             displayPointCount = 0
@@ -339,33 +388,40 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                         Text(stringResource(R.string.ar_splat_capture_start))
                     }
                 } else {
-                    // Left button: New Capture (ALWAYS present here)
-                    Button(
-                        onClick = {
-                            if (pendingFrames == 0 && processedFrames > 0) {
-                                showDiscardDialog = true
-                            } else {
-                                if (pipelineHandle != 0L) {
-                                    SplatCapturePipeline.clearPipeline(pipelineHandle)
-                                }
-                                internalFrameCount.set(0)
-                                displayFrameCount = 0
-                                displayPointCount = 0
-                                captureContext.lastPose = null
-                                tempDir.deleteRecursively()
-                                tempDir.mkdirs()
-                                File(tempDir, "images").mkdirs()
-                                isGenerating = false
-                            }
-                        },
+                    // Left column: New Capture (ALWAYS present here)
+                    Column(
                         modifier = Modifier.weight(1f),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color.Red)
+                        verticalArrangement = Arrangement.Bottom
                     ) {
-                        Text("New Capture")
+                        Button(
+                            onClick = {
+                                if (isGenerating || isExportReady) {
+                                    showDiscardDialog = true
+                                } else {
+                                    if (pipelineHandle != 0L) {
+                                        SplatCapturePipeline.clearPipeline(pipelineHandle)
+                                    }
+                                    internalFrameCount.set(0)
+                                    displayFrameCount = 0
+                                    displayPointCount = 0
+                                    processingPhase = 0
+                                    captureContext.lastPose = null
+                                    tempDir.deleteRecursively()
+                                    tempDir.mkdirs()
+                                    File(tempDir, "images").mkdirs()
+                                    isGenerating = false
+                                    isExportReady = false
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color.Red)
+                        ) {
+                            Text("New Capture")
+                        }
                     }
 
                     // Right button: Generate OR Export
-                    if (pendingFrames == 0 && processedFrames > 0) {
+                    if (isExportReady) {
                         // Export Button
                         Button(
                             onClick = {
@@ -373,7 +429,6 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                                 isExporting = true
                                 coroutineScope.launch(Dispatchers.IO) {
                                     try {
-                                        SplatCapturePipeline.exportDataset(pipelineHandle, tempDir.absolutePath)
                                         val zipFile = File(context.cacheDir, "export.zip")
                                         if (zipFile.exists()) {
                                             zipFile.delete()
@@ -407,20 +462,67 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                         }
                     } else {
                         // Generate Button
-                        Button(
-                            onClick = {
-                                isGenerating = true
-                                totalFramesToProcess = pendingFrames
-                                SplatCapturePipeline.startDepthGeneration(pipelineHandle)
-                            },
-                            enabled = !isGenerating && pipelineHandle != 0L && pendingFrames > 0,
-                            modifier = Modifier.weight(1f),
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-                        ) {
+                        Column(modifier = Modifier.weight(1f)) {
                             if (isGenerating) {
-                                Text("Generating $processedFrames / $totalFramesToProcess")
-                            } else {
-                                Text("Generate Depth Maps")
+                                val phaseText = when (processingPhase) {
+                                    0 -> "Starting..."
+                                    1 -> "Extracting Features..."
+                                    2 -> "Culling Matches..."
+                                    3 -> "Matching & Triangulating..."
+                                    4 -> "Bundle Adjustment..."
+                                    5 -> "Exporting..."
+                                    6 -> "Complete"
+                                    else -> "Processing..."
+                                }
+                                Text(
+                                    text = phaseText,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    modifier = Modifier.align(Alignment.CenterHorizontally).padding(bottom = 4.dp)
+                                )
+                                androidx.compose.material3.LinearProgressIndicator(
+                                    modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp)
+                                )
+                            }
+                            
+                            Button(
+                                onClick = {
+                                    if (internalFrameCount.get() > 0) {
+                                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                                            notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                                        }
+                                        
+                                        isGenerating = true
+                                        totalFramesToProcess = internalFrameCount.get()
+                                        isCapturing = false
+                                        processingPhase = 0
+    
+                                        val serviceIntent = android.content.Intent(context, io.github.sceneview.demo.service.SplatProcessService::class.java).apply {
+                                            action = io.github.sceneview.demo.service.SplatProcessService.ACTION_START_PROCESSING
+                                            putExtra("manifest_path", File(tempDir, "manifest.txt").absolutePath)
+                                            putExtra("pipeline_handle", pipelineHandle)
+                                        }
+                                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                                            context.startForegroundService(serviceIntent)
+                                        } else {
+                                            context.startService(serviceIntent)
+                                        }
+                                    }
+                                },
+                                enabled = !isGenerating && internalFrameCount.get() > 0,
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                            ) {
+                                if (isGenerating) {
+                                    androidx.compose.material3.CircularProgressIndicator(
+                                        modifier = Modifier.size(20.dp),
+                                        color = MaterialTheme.colorScheme.onPrimary,
+                                        strokeWidth = 2.dp
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text("Generating...")
+                                } else {
+                                    Text("Generate Point Cloud")
+                                }
                             }
                         }
                     }
@@ -442,7 +544,7 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                 },
                     sessionConfiguration = { session, config ->
                         config.focusMode = if (isAutoFocus) Config.FocusMode.AUTO else Config.FocusMode.FIXED
-                        config.depthMode = Config.DepthMode.RAW_DEPTH_ONLY
+                        config.depthMode = Config.DepthMode.DISABLED
                     },
                     onSessionUpdated = { session, frame ->
                         if (arSession != session) {
@@ -468,24 +570,13 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                                 captureContext.lastPose = currentPose
                                 
                                 var cameraImage: Image? = null
-                                var rawDepthImage: Image? = null
-                                var confidenceImage: Image? = null
                                 
                                 try {
                                     cameraImage = frame.cameraImage()
-                                    rawDepthImage = frame.acquireRawDepthImage16Bits()
-                                    confidenceImage = frame.acquireRawDepthConfidenceImage()
-                                    var pointCloud: com.google.ar.core.PointCloud? = null
-                                    
-                                    try {
-                                        pointCloud = frame.acquirePointCloud()
-                                        if (cameraImage != null && rawDepthImage != null && confidenceImage != null && pointCloud != null) {
+                                    if (cameraImage != null) {
                                         val yPlane = cameraImage.planes[0]
                                         val uPlane = cameraImage.planes[1]
                                         val vPlane = cameraImage.planes[2]
-                                        
-                                        val depthPlane = rawDepthImage.planes[0]
-                                        val confidencePlane = confidenceImage.planes[0]
                                         
                                         val poseMatrix = FloatArray(16)
                                         frame.camera.pose.toMatrix(poseMatrix, 0)
@@ -514,69 +605,61 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                                             }
                                         }
                                         
-                                        val aspect_ratio = camW.toFloat() / camH.toFloat()
-                                        val target_aspect = 16.0f / 9.0f
-                                        var W_cropped = camW
-                                        var H_cropped = camH
-                                        var offset_x = 0f
-                                        var offset_y = 0f
-
-                                        if (aspect_ratio >= target_aspect) {
-                                            W_cropped = (camH * target_aspect).roundToInt() and 1.inv()
-                                            offset_x = (((camW - W_cropped) / 2) and 1.inv()).toFloat()
-                                        } else {
-                                            H_cropped = (camW / target_aspect).roundToInt() and 1.inv()
-                                            offset_y = (((camH - H_cropped) / 2) and 1.inv()).toFloat()
-                                        }
-                                        
-                                        val cx_cropped = cx - offset_x
-                                        val cy_cropped = cy - offset_y
-                                        
-                                        val fx_rot = fy
-                                        val fy_rot = fx
-                                        val cx_rot = H_cropped.toFloat() - cy_cropped
-                                        val cy_rot = cx_cropped
-                                        
-                                        val scale_x = 504.0f / H_cropped.toFloat()
-                                        val scale_y = 896.0f / W_cropped.toFloat()
-                                        
-                                        val fx_final = fx_rot * scale_x
-                                        val fy_final = fy_rot * scale_y
-                                        val cx_final = cx_rot * scale_x
-                                        val cy_final = cy_rot * scale_y
-                                        
                                         val timestamp = System.currentTimeMillis()
                                         val imageRelPath = "images/frame_${timestamp}.jpg"
                                         val imageFile = File(tempDir, imageRelPath)
                                         
-                                        val success = SplatCapturePipeline.processFrame(
-                                            pipelineHandle,
-                                            yPlane.buffer, yPlane.rowStride,
-                                            uPlane.buffer, uPlane.rowStride, uPlane.pixelStride,
-                                            vPlane.buffer, vPlane.rowStride, vPlane.pixelStride,
-                                            cameraImage.width, cameraImage.height,
-                                            depthPlane.buffer, rawDepthImage.width, rawDepthImage.height,
-                                            confidencePlane.buffer,
-                                            pointCloud.points, pointCloud.points.capacity() / 4,
-                                            poseMatrix,
-                                            fx_final, fy_final, cx_final, cy_final,
-                                            imageFile.absolutePath, imageRelPath
-                                        )
-                                        
-                                        if (success) {
+                                        // Save JPEG (Color NV21)
+                                        try {
+                                            val nv21 = ByteArray(cameraImage.width * cameraImage.height * 3 / 2)
+                                            val yBuffer = yPlane.buffer
+                                            val uBuffer = uPlane.buffer
+                                            val vBuffer = vPlane.buffer
+                                            
+                                            yBuffer.position(0)
+                                            uBuffer.position(0)
+                                            vBuffer.position(0)
+                                            
+                                            val ySize = yBuffer.remaining()
+                                            yBuffer.get(nv21, 0, ySize)
+                                            
+                                            if (vPlane.pixelStride == 2) {
+                                                // NV21 interleaved
+                                                val vSize = vBuffer.remaining()
+                                                vBuffer.get(nv21, ySize, Math.min(vSize, nv21.size - ySize))
+                                            } else {
+                                                // Planar (slow fallback for non-interleaved, very rare on modern ARCore)
+                                                val vSize = vBuffer.remaining()
+                                                val uSize = uBuffer.remaining()
+                                                vBuffer.get(nv21, ySize, Math.min(vSize, nv21.size - ySize))
+                                                uBuffer.get(nv21, ySize + vSize, Math.min(uSize, nv21.size - ySize - vSize))
+                                            }
+                                            
+                                            val yuvImage = YuvImage(nv21, ImageFormat.NV21, cameraImage.width, cameraImage.height, null)
+                                            val out = FileOutputStream(imageFile)
+                                            yuvImage.compressToJpeg(Rect(0, 0, cameraImage.width, cameraImage.height), 95, out)
+                                            out.close()
+                                            
+                                            // Append to manifest.txt using RAW unrotated intrinsics corresponding to the saved image
+                                            val manifestFile = File(tempDir, "manifest.txt")
+                                            val count = internalFrameCount.get()
+                                            if (count == 0) {
+                                                manifestFile.writeText("${tempDir.absolutePath}\n0\n")
+                                            }
+                                            
+                                            // Append frame info
+                                            val poseStr = poseMatrix.joinToString(" ")
+                                            manifestFile.appendText("${imageFile.absolutePath} $fx $fy $cx $cy $camW $camH $poseStr\n")
+                                            
                                             internalFrameCount.incrementAndGet()
+                                        } catch(e: Exception) {
+                                            e.printStackTrace()
                                         }
                                     }
-                                        } catch (e: Exception) {
-                                        } finally {
-                                            pointCloud?.close()
-                                        }
-                                    } catch (e: Exception) {
-                                    } finally {
-                                        cameraImage?.close()
-                                        rawDepthImage?.close()
-                                        confidenceImage?.close()
-                                    }
+                                } catch (e: Exception) {
+                                } finally {
+                                    cameraImage?.close()
+                                }
                             }
                         }
                     }
@@ -595,7 +678,7 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text(text = stringResource(R.string.ar_splat_capture_frames, displayFrameCount), style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
                     }
-                    if (!isCapturing) {
+                    if (isExportReady) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Text(text = stringResource(R.string.ar_splat_capture_points, displayPointCount), style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
                         }
@@ -626,14 +709,20 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                         if (pipelineHandle != 0L) {
                             SplatCapturePipeline.clearPipeline(pipelineHandle)
                         }
+                        
+                        // Also stop the service directly if it's running
+                        context.stopService(android.content.Intent(context, io.github.sceneview.demo.service.SplatProcessService::class.java))
+                        
                         internalFrameCount.set(0)
                         displayFrameCount = 0
                         displayPointCount = 0
+                        processingPhase = 0
                         captureContext.lastPose = null
                         tempDir.deleteRecursively()
                         tempDir.mkdirs()
                         File(tempDir, "images").mkdirs()
                         isGenerating = false
+                        isExportReady = false
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Color.Red)
                 ) {

@@ -1,973 +1,294 @@
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
-
-#include <algorithm>
 #include <android/log.h>
-#include <array>
-#include <atomic>
-#include <cmath>
-#include <condition_variable>
-#include <cstring>
-#include <fstream>
 #include <jni.h>
 #include <memory>
-#include <mutex>
-#include <queue>
-#include <random>
 #include <string>
-#include <thread>
-#include <unordered_map>
-#include <vector>
-
-#include "libyuv.h"
-#include "litert/c/litert_common.h"
-#include "litert/c/litert_compiled_model.h"
-#include "litert/c/litert_environment.h"
-#include "litert/c/litert_model.h"
-#include "litert/c/litert_options.h"
-#include "litert/c/litert_tensor_buffer.h"
 
 #define LOG_TAG "SplatCaptureJNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-struct Voxel {
-  float x = 0.0f;
-  float y = 0.0f;
-  float z = 0.0f;
-  float r = 0.0f;
-  float g = 0.0f;
-  float b = 0.0f;
-  float weight = 0.0f;
-  bool occupied = false;
-};
-
-struct Chunk {
-  std::array<Voxel, 4096> voxels;
-};
-
-struct ExportFrame {
-  std::string file_path;
-  float fx;
-  float fy;
-  float cx;
-  float cy;
-  std::array<float, 16> pose; // column-major
-};
-
-struct FrameTask {
-  std::vector<uint8_t> y_data;
-  std::vector<uint8_t> u_data;
-  std::vector<uint8_t> v_data;
-  int y_stride, u_stride, u_pixel_stride, v_stride, v_pixel_stride;
-  int width, height;
-
-  std::vector<uint16_t> depth_data;
-  int depth_width, depth_height;
-
-  std::vector<uint8_t> confidence_data;
-  std::vector<float> slam_points_data;
-
-  std::array<float, 16> pose_matrix;
-  float fx, fy, cx, cy;
-
-  std::string image_file_path;
-  std::string image_relative_path;
-};
-
-struct Anchor {
-  float u_ai;
-  float v_ai;
-  float z_ai_linear;
-  float z_metric;
-};
-
-struct RansacResult {
-  float s = 1.0f;
-  float t = 0.0f;
-  int best_inliers = 0;
-  bool success = false;
-};
+#include "feature_extractor.h"
+#include "match_culling.h"
+#include "feature_matcher.h"
+#include "triangulator.h"
+#include "bundle_adjuster.h"
+#include "exporter.h"
+#include <fstream>
+#include <sstream>
+#include <mutex>
+#include <chrono>
+#include <thread>
+#include <atomic>
 
 class SplatCapturePipeline {
 public:
-  SplatCapturePipeline(const std::string &model_path)
-      : model_path_(model_path) {
-    worker_thread_ = std::thread(&SplatCapturePipeline::WorkerLoop, this);
-  }
-
-  ~SplatCapturePipeline() {
-    {
-      std::lock_guard<std::mutex> lock(queue_mutex_);
-      stop_worker_ = true;
-    }
-    queue_cv_.notify_one();
-    if (worker_thread_.joinable()) {
-      worker_thread_.join();
-    }
-  }
-
-  void EnqueueFrame(FrameTask &&task) {
-    {
-      std::lock_guard<std::mutex> lock(queue_mutex_);
-      task_queue_.push(std::move(task));
-    }
-    queue_cv_.notify_one();
-  }
-
-  int GetPointCount() {
-    return total_point_count_.load(std::memory_order_relaxed);
-  }
-
-  void ExportDataset(const std::string &output_dir) {
-    std::lock_guard<std::mutex> lock(data_mutex_);
-
-    // 1. Write points.ply
-    std::string ply_path = output_dir + "/points.ply";
-    std::ofstream ply_file(ply_path, std::ios::binary);
-    if (!ply_file.is_open()) {
-      LOGE("Failed to open PLY file for writing: %s", ply_path.c_str());
-      return;
-    }
-
-    std::vector<Voxel> occupied_voxels;
-    for (const auto &pair : voxel_grid_) {
-      for (const auto &voxel : pair.second.voxels) {
-        if (voxel.occupied && voxel.weight >= 3.0f) {
-          occupied_voxels.push_back(voxel);
-        }
+  SplatCapturePipeline(const std::string &model_path) {
+      extractor_ = std::make_unique<FeatureExtractor>();
+      if (!extractor_->initialize(model_path)) {
+          LOGE("Failed to initialize FeatureExtractor");
       }
-    }
+      culler_ = std::make_unique<MatchCuller>();
+      matcher_ = std::make_unique<FeatureMatcher>();
+      triangulator_ = std::make_unique<Triangulator>();
+      bundle_adjuster_ = std::make_unique<BundleAdjuster>();
+      exporter_ = std::make_unique<Exporter>();
+  }
+  
+  ~SplatCapturePipeline() {}
 
-    ply_file << "ply\n"
-             << "format binary_little_endian 1.0\n"
-             << "element vertex " << occupied_voxels.size() << "\n"
-             << "property float x\n"
-             << "property float y\n"
-             << "property float z\n"
-             << "property uchar red\n"
-             << "property uchar green\n"
-             << "property uchar blue\n"
-             << "end_header\n";
+  void ProcessDataset(const std::string &manifest_path) {
+      std::lock_guard<std::mutex> lock(process_mutex_);
+      current_phase_ = 0; // Starting
+      cancel_ = false;
+      LOGI("ProcessDataset called with manifest: %s", manifest_path.c_str());
+      
+      std::ifstream infile(manifest_path);
+      if (!infile.is_open()) {
+          LOGE("Failed to open manifest");
+          return;
+      }
+      
+      std::string line;
+      std::getline(infile, line);
+      std::stringstream ss(line);
+      double fx, fy, cx, cy, w, h;
+      std::string output_dir;
+      ss >> output_dir;
+      
+      // Skip the count line
+      std::getline(infile, line);
+      
+      std::vector<CameraPose> poses;
+      std::vector<cv::Mat> images;
+      std::vector<std::string> image_names;
+      
+      while (std::getline(infile, line)) {
+          if (line.empty()) continue;
+          std::stringstream ss2(line);
+          std::string img_path;
+          ss2 >> img_path;
+          
+          float fx, fy, cx, cy;
+          int w, h;
+          ss2 >> fx >> fy >> cx >> cy >> w >> h;
+          
+          cv::Mat pose_mat(4, 4, CV_32F);
+          // Correct column-major parsing
+          for (int c = 0; c < 4; ++c) {
+              for (int r = 0; r < 4; ++r) {
+                  ss2 >> pose_mat.at<float>(r, c);
+              }
+          }
+          
+          CameraPose pose;
+          cv::Mat R_gl = pose_mat(cv::Rect(0, 0, 3, 3));
+          cv::Mat t_gl = pose_mat(cv::Rect(3, 0, 1, 3));
 
-    for (const auto &v : occupied_voxels) {
-      float x = v.x;
-      float y = v.y;
-      float z = v.z;
-      uint8_t r = static_cast<uint8_t>(std::clamp(v.r, 0.0f, 255.0f));
-      uint8_t g = static_cast<uint8_t>(std::clamp(v.g, 0.0f, 255.0f));
-      uint8_t b = static_cast<uint8_t>(std::clamp(v.b, 0.0f, 255.0f));
-
-      ply_file.write(reinterpret_cast<const char *>(&x), sizeof(float));
-      ply_file.write(reinterpret_cast<const char *>(&y), sizeof(float));
-      ply_file.write(reinterpret_cast<const char *>(&z), sizeof(float));
-      ply_file.write(reinterpret_cast<const char *>(&r), sizeof(uint8_t));
-      ply_file.write(reinterpret_cast<const char *>(&g), sizeof(uint8_t));
-      ply_file.write(reinterpret_cast<const char *>(&b), sizeof(uint8_t));
-    }
-    ply_file.close();
-    LOGI("Successfully exported %zu points to points.ply",
-         occupied_voxels.size());
-
-    // 2. Write transforms.json
-    std::string json_path = output_dir + "/transforms.json";
-    std::ofstream json_file(json_path);
-    if (!json_file.is_open()) {
-      LOGE("Failed to open transforms.json for writing: %s", json_path.c_str());
-      return;
-    }
-
-    json_file << "{\n"
-              << "  \"camera_model\": \"PERSPECTIVE\",\n"
-              << "  \"w\": 504,\n"
-              << "  \"h\": 896,\n"
-              << "  \"ply_file_path\": \"points.ply\",\n"
-              << "  \"frames\": [\n";
-
-    for (size_t i = 0; i < export_frames_.size(); ++i) {
-      const auto &frame = export_frames_[i];
-
-      // Apply 90-degree Z-axis rotation to align landscape sensor pose with
-      // portrait image coordinate frame. Rotated Pose = M_pose * T_p_to_s Where
-      // T_p_to_s is:
-      //   [ 0  -1   0   0 ]
-      //   [ 1   0   0   0 ]
-      //   [ 0   0   1   0 ]
-      //   [ 0   0   0   1 ]
-      // Column-major multiplication results in Row-major:
-      // Row 0: [  M[4], -M[0], M[8],  M[12] ]
-      // Row 1: [  M[5], -M[1], M[9],  M[13] ]
-      // Row 2: [  M[6], -M[2], M[10], M[14] ]
-      // Row 3: [  M[7], -M[3], M[11], M[15] ]
-      const auto &m = frame.pose;
-      std::array<float, 4> r0 = {m[4], -m[0], m[8], m[12]};
-      std::array<float, 4> r1 = {m[5], -m[1], m[9], m[13]};
-      std::array<float, 4> r2 = {m[6], -m[2], m[10], m[14]};
-      std::array<float, 4> r3 = {m[7], -m[3], m[11], m[15]};
-
-      json_file << "    {\n"
-                << "      \"file_path\": \"" << frame.file_path << "\",\n"
-                << "      \"fl_x\": " << frame.fx << ",\n"
-                << "      \"fl_y\": " << frame.fy << ",\n"
-                << "      \"cx\": " << frame.cx << ",\n"
-                << "      \"cy\": " << frame.cy << ",\n"
-                << "      \"transform_matrix\": [\n"
-                << "        [" << r0[0] << ", " << r0[1] << ", " << r0[2]
-                << ", " << r0[3] << "],\n"
-                << "        [" << r1[0] << ", " << r1[1] << ", " << r1[2]
-                << ", " << r1[3] << "],\n"
-                << "        [" << r2[0] << ", " << r2[1] << ", " << r2[2]
-                << ", " << r2[3] << "],\n"
-                << "        [" << r3[0] << ", " << r3[1] << ", " << r3[2]
-                << ", " << r3[3] << "]\n"
-                << "      ]\n"
-                << "    }" << (i == export_frames_.size() - 1 ? "" : ",")
-                << "\n";
-    }
-
-    json_file << "  ]\n"
-              << "}\n";
-    json_file.close();
-    LOGI("Successfully exported transforms.json");
+          // Convert from ARCore Camera-to-World (OpenGL) to OpenCV World-to-Camera
+          cv::Mat S = (cv::Mat_<float>(3, 3) << 1, 0, 0, 0, -1, 0, 0, 0, -1);
+          pose.R = S * R_gl.t();
+          pose.t = -pose.R * t_gl;
+          pose.w = w;
+          pose.h = h;
+          pose.K = (cv::Mat_<float>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
+          
+          poses.push_back(pose);
+          
+          cv::Mat img = cv::imread(img_path);
+          images.push_back(img);
+          
+          size_t slash_pos = img_path.find_last_of('/');
+          image_names.push_back((slash_pos != std::string::npos) ? img_path.substr(slash_pos + 1) : img_path);
+      }
+      
+      LOGI("Loaded %zu frames", poses.size());
+      
+      // Feature Extraction
+      current_phase_ = 1;
+      auto t0 = std::chrono::steady_clock::now();
+      std::vector<std::vector<Keypoint>> all_keypoints(poses.size());
+      for (size_t i = 0; i < images.size(); ++i) {
+          if (cancel_) return;
+          all_keypoints[i] = extractor_->extractFeatures(images[i]);
+      }
+      auto t1 = std::chrono::steady_clock::now();
+      LOGI("Phase 1 (Extraction) took %lld ms", (long long)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+      
+      // Match Culling
+      current_phase_ = 2;
+      auto pairs = culler_->getValidPairs(poses);
+      auto t2 = std::chrono::steady_clock::now();
+      LOGI("Phase 2 (Culling) took %lld ms", (long long)std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
+      
+      current_phase_ = 3;
+          auto t_match_start = std::chrono::steady_clock::now();
+          
+          // Setup Union-Find
+          std::vector<int> cam_starts(images.size(), 0);
+          int total_kpts = 0;
+          for (size_t i = 0; i < all_keypoints.size(); ++i) {
+              cam_starts[i] = total_kpts;
+              total_kpts += all_keypoints[i].size();
+          }
+          
+          std::vector<int> parent(total_kpts);
+          for (int i = 0; i < total_kpts; ++i) parent[i] = i;
+          
+          auto find_set = [&](int i) {
+              int root = i;
+              while (root != parent[root]) root = parent[root];
+              int curr = i;
+              while (curr != root) {
+                  int nxt = parent[curr];
+                  parent[curr] = root;
+                  curr = nxt;
+              }
+              return root;
+          };
+          auto union_set = [&](int i, int j) {
+              int root_i = find_set(i);
+              int root_j = find_set(j);
+              if (root_i != root_j) parent[root_j] = root_i;
+          };
+          
+          // Parallel Matching
+          std::vector<std::vector<FeatureMatch>> thread_matches(pairs.size());
+          
+          int num_threads = std::thread::hardware_concurrency();
+          if (num_threads == 0) num_threads = 4;
+          std::vector<std::thread> workers;
+          std::atomic<int> current_idx{0};
+          for (int t = 0; t < num_threads; ++t) {
+              workers.emplace_back([&]() {
+                  while (!cancel_) {
+                      int i = current_idx.fetch_add(1);
+                      if (i >= pairs.size()) break;
+                      if (cancel_) return;
+                      const auto& pair = pairs[i];
+                      auto matches = matcher_->matchMNN(all_keypoints[pair.first], all_keypoints[pair.second]);
+                      thread_matches[i] = matcher_->filterEpipolar(matches, all_keypoints[pair.first], all_keypoints[pair.second], poses[pair.first], poses[pair.second]);
+                  }
+              });
+          }
+          for (auto& w : workers) { w.join(); }
+          
+          if (cancel_) return;
+          for (size_t i = 0; i < pairs.size(); ++i) {
+              const auto& pair = pairs[i];
+              for (const auto& m : thread_matches[i]) {
+                  int global_a = cam_starts[pair.first] + m.idx_a;
+                  int global_b = cam_starts[pair.second] + m.idx_b;
+                  union_set(global_a, global_b);
+              }
+          }
+          
+          auto t_match_end = std::chrono::steady_clock::now();
+          LOGI("Phase 3 (Matching) took %lld ms", (long long)std::chrono::duration_cast<std::chrono::milliseconds>(t_match_end - t_match_start).count());
+          
+          // Collect Tracks
+          auto t_tri_start = std::chrono::steady_clock::now();
+          std::map<int, Track> track_map;
+          for (size_t c = 0; c < all_keypoints.size(); ++c) {
+              for (size_t k = 0; k < all_keypoints[c].size(); ++k) {
+                  int global_id = cam_starts[c] + k;
+                  int root = find_set(global_id);
+                  track_map[root].observations.push_back({static_cast<int>(c), all_keypoints[c][k].pt});
+              }
+          }
+          
+          std::vector<Track> flat_tracks;
+          flat_tracks.reserve(track_map.size());
+          for (auto& kv : track_map) {
+              flat_tracks.push_back(std::move(kv.second));
+          }
+          
+          // Parallel Triangulation
+          std::vector<bool> valid_flags(flat_tracks.size(), false);
+          
+          int num_threads2 = std::thread::hardware_concurrency();
+          if (num_threads2 == 0) num_threads2 = 4;
+          std::vector<std::thread> workers2;
+          std::atomic<int> current_idx2{0};
+          for (int t = 0; t < num_threads2; ++t) {
+              workers2.emplace_back([&]() {
+                  while (!cancel_) {
+                      int i = current_idx2.fetch_add(1);
+                      if (i >= flat_tracks.size()) break;
+                      if (cancel_) return;
+                      Track& t = flat_tracks[i];
+                      
+                      std::set<int> seen_cams;
+                      bool valid = true;
+                      for (const auto& obs : t.observations) {
+                          if (seen_cams.count(obs.camera_idx)) {
+                              valid = false;
+                              break;
+                          }
+                          seen_cams.insert(obs.camera_idx);
+                      }
+                      
+                      if (valid && t.observations.size() >= 2) {
+                          if (triangulator_->triangulateTrack(t, poses)) {
+                              valid_flags[i] = true;
+                          }
+                      }
+                  }
+              });
+          }
+          for (auto& w : workers2) { w.join(); }
+          
+          if (cancel_) return;
+          std::vector<Track> tracks;
+          tracks.reserve(flat_tracks.size());
+          for (size_t i = 0; i < flat_tracks.size(); ++i) {
+              if (valid_flags[i]) {
+                  tracks.push_back(std::move(flat_tracks[i]));
+              }
+          }
+          
+          auto t_tri_end = std::chrono::steady_clock::now();
+          LOGI("Phase 3 (Triangulation) took %lld ms", (long long)std::chrono::duration_cast<std::chrono::milliseconds>(t_tri_end - t_tri_start).count());
+          
+          // Bundle Adjustment
+          current_phase_ = 4;
+          auto t_ba_start = std::chrono::steady_clock::now();
+          bundle_adjuster_->optimize(poses, tracks, 20);
+          auto t_ba_end = std::chrono::steady_clock::now();
+          LOGI("Phase 4 (BA) took %lld ms", (long long)std::chrono::duration_cast<std::chrono::milliseconds>(t_ba_end - t_ba_start).count());
+          
+      point_count_ = tracks.size();
+      
+      // Export
+      if (cancel_) return;
+      current_phase_ = 5;
+      auto t_export_start = std::chrono::steady_clock::now();
+      exporter_->exportNerfstudio(images, image_names, poses, tracks, output_dir);
+      auto t_export_end = std::chrono::steady_clock::now();
+      LOGI("Phase 5 (Export) took %lld ms", (long long)std::chrono::duration_cast<std::chrono::milliseconds>(t_export_end - t_export_start).count());
+      
+            current_phase_ = 6; // Complete
   }
 
-  void StartCompute() {
-    {
-      std::lock_guard<std::mutex> lock(queue_mutex_);
-      start_compute_ = true;
-    }
-    queue_cv_.notify_one();
-  }
-
-  void Clear() {
-    std::lock_guard<std::mutex> lock_q(queue_mutex_);
-    std::lock_guard<std::mutex> lock_d(data_mutex_);
-
-    std::queue<FrameTask> empty_q;
-    std::swap(task_queue_, empty_q);
-
-    voxel_grid_.clear();
-    export_frames_.clear();
-    start_compute_ = false;
-    total_point_count_.store(0, std::memory_order_relaxed);
-    is_first_frame_ = true;
-    calibration_frames_ = 0;
-  }
-
-  int GetPendingFramesCount() {
-    std::lock_guard<std::mutex> lock(queue_mutex_);
-    return static_cast<int>(task_queue_.size());
-  }
-
-  int GetProcessedFramesCount() {
-    std::lock_guard<std::mutex> lock(data_mutex_);
-    return static_cast<int>(export_frames_.size());
-  }
-
-  int is_gpu_enabled_ = 0; // 0 = unknown, 1 = GPU, -1 = CPU
+  void Clear() { cancel_ = true; }
+  int GetPendingFramesCount() { return 0; }
+  int GetProcessedFramesCount() { return 0; }
+  int GetPointCount() { return point_count_; }
+  int GetProcessingPhase() { return current_phase_.load(); }
 
 private:
-  void WorkerLoop() {
-    // Initialize LiteRT strictly inside the background thread to prevent GPU
-    // delegate context issues
-    if (LiteRtCreateEnvironment(0, nullptr, &env_) != kLiteRtStatusOk) {
-      LOGE("Failed to create LiteRT environment.");
-      return;
-    }
-
-    if (LiteRtCreateModelFromFile(env_, model_path_.c_str(), &model_) !=
-        kLiteRtStatusOk) {
-      LOGE("Failed to load LiteRT model from path: %s", model_path_.c_str());
-      return;
-    }
-
-    if (LiteRtCreateOptions(&options_) != kLiteRtStatusOk) {
-      LOGE("Failed to create LiteRT options.");
-      return;
-    }
-
-    // Try GPU acceleration first
-    if (LiteRtSetOptionsHardwareAccelerators(
-            options_, kLiteRtHwAcceleratorGpu) == kLiteRtStatusOk) {
-      if (LiteRtCreateCompiledModel(env_, model_, options_, &compiled_model_) ==
-          kLiteRtStatusOk) {
-        bool fully_accelerated = false;
-        LiteRtCompiledModelIsFullyAccelerated(compiled_model_,
-                                              &fully_accelerated);
-        if (fully_accelerated) {
-          is_gpu_enabled_ = 1;
-          LOGI("LiteRT GPU acceleration successfully enabled and fully "
-               "accelerated.");
-        } else {
-          is_gpu_enabled_ = 1;
-          LOGI("LiteRT GPU acceleration partially enabled (some ops on CPU).");
-        }
-      } else {
-        compiled_model_ = nullptr;
-      }
-    }
-
-    // Fallback to CPU if GPU failed
-    if (!compiled_model_) {
-      LOGE("Failed to compile with GPU. Falling back to CPU.");
-      LiteRtSetOptionsHardwareAccelerators(options_, kLiteRtHwAcceleratorCpu);
-      if (LiteRtCreateCompiledModel(env_, model_, options_, &compiled_model_) !=
-          kLiteRtStatusOk) {
-        LOGE("Failed to compile LiteRT model even on CPU.");
-        return;
-      }
-      is_gpu_enabled_ = -1;
-      LOGI("LiteRT CPU execution successfully initialized.");
-    }
-
-    LOGI("LiteRT native thread successfully initialized.");
-
-    while (true) {
-      FrameTask task;
-      {
-        std::unique_lock<std::mutex> lock(queue_mutex_);
-        queue_cv_.wait(lock, [this]() {
-          return (!task_queue_.empty() && start_compute_) || stop_worker_;
-        });
-
-        if (stop_worker_ && task_queue_.empty()) {
-          break;
-        }
-
-        if (task_queue_.empty() || !start_compute_) {
-          continue;
-        }
-
-        task = std::move(task_queue_.front());
-        task_queue_.pop();
-      }
-
-      ProcessFrameInternal(task);
-    }
-
-    // Clean up resources on the same thread
-    if (compiled_model_)
-      LiteRtDestroyCompiledModel(compiled_model_);
-    if (options_)
-      LiteRtDestroyOptions(options_);
-    if (model_)
-      LiteRtDestroyModel(model_);
-    if (env_)
-      LiteRtDestroyEnvironment(env_);
-
-    LOGI("LiteRT native thread successfully terminated.");
-  }
-
-  void ProcessFrameInternal(const FrameTask &task) {
-    int W = task.width;
-    int H = task.height;
-
-    // 1. Android420ToI420 planar alignment using libyuv
-    int stride_y = W;
-    int stride_u = W / 2;
-    int stride_v = W / 2;
-
-    std::vector<uint8_t> contiguous_y(W * H);
-    std::vector<uint8_t> contiguous_u(W * H / 4);
-    std::vector<uint8_t> contiguous_v(W * H / 4);
-
-    libyuv::Android420ToI420(
-        task.y_data.data(), task.y_stride, task.u_data.data(), task.u_stride,
-        task.v_data.data(), task.v_stride,
-        task.u_pixel_stride, // pixel_stride of uv (assuming u and v strides are
-                             // symmetric)
-        contiguous_y.data(), stride_y, contiguous_u.data(), stride_u,
-        contiguous_v.data(), stride_v, W, H);
-
-    // 2. Crop to 16:9 ratio
-    int W_cropped = W;
-    int H_cropped = H;
-    int offset_x = 0;
-    int offset_y = 0;
-
-    double aspect_ratio = (double)W / H;
-    double target_aspect = 16.0 / 9.0;
-
-    if (aspect_ratio >= target_aspect) {
-      W_cropped = static_cast<int>(std::round(H * target_aspect)) & ~1;
-      offset_x = ((W - W_cropped) / 2) & ~1;
-    } else {
-      H_cropped = static_cast<int>(std::round(W / target_aspect)) & ~1;
-      offset_y = ((H - H_cropped) / 2) & ~1;
-    }
-
-    const uint8_t *crop_y =
-        contiguous_y.data() + offset_y * stride_y + offset_x;
-    const uint8_t *crop_u =
-        contiguous_u.data() + (offset_y / 2) * stride_u + (offset_x / 2);
-    const uint8_t *crop_v =
-        contiguous_v.data() + (offset_y / 2) * stride_v + (offset_x / 2);
-
-    // 3. Resize/Scale to exactly 896x504 landscape
-    std::vector<uint8_t> scaled_y(896 * 504);
-    std::vector<uint8_t> scaled_u(448 * 252);
-    std::vector<uint8_t> scaled_v(448 * 252);
-
-    libyuv::I420Scale(crop_y, stride_y, crop_u, stride_u, crop_v, stride_v,
-                      W_cropped, H_cropped, scaled_y.data(), 896,
-                      scaled_u.data(), 448, scaled_v.data(), 448, 896, 504,
-                      libyuv::kFilterBox);
-
-    // 4. Rotate 90 degrees clockwise (kRotate90) to yield 504x896 portrait
-    std::vector<uint8_t> rotated_y(504 * 896);
-    std::vector<uint8_t> rotated_u(252 * 448);
-    std::vector<uint8_t> rotated_v(252 * 448);
-
-    libyuv::I420Rotate(scaled_y.data(), 896, scaled_u.data(), 448,
-                       scaled_v.data(), 448, rotated_y.data(), 504,
-                       rotated_u.data(), 252, rotated_v.data(), 252, 896, 504,
-                       libyuv::kRotate90);
-
-    // 5. Convert I420 to RGB (outputs true R-G-B byte order in RAW format)
-    std::vector<uint8_t> rgb_data(504 * 896 * 3);
-    libyuv::I420ToRAW(rotated_y.data(), 504, rotated_u.data(), 252,
-                      rotated_v.data(), 252, rgb_data.data(), 504 * 3, 504,
-                      896);
-
-    // Save rotated RGB image to output file path using stb_image_write
-    stbi_write_jpg(task.image_file_path.c_str(), 504, 896, 3, rgb_data.data(),
-                   85);
-
-    // ---------------------------------------------------------
-    // REPLACEMENT FOR STEP 6 & 7: Dynamic Tensor Formatting
-    // ---------------------------------------------------------
-    LiteRtTensorBufferRequirements input_reqs;
-    if (LiteRtGetCompiledModelInputBufferRequirements(
-            compiled_model_, 0, 0, &input_reqs) != kLiteRtStatusOk) {
-      LOGE("Failed to get input buffer requirements.");
-      return;
-    }
-
-    LiteRtLayout input_layout;
-    if (LiteRtGetCompiledModelInputTensorLayout(
-            compiled_model_, 0, 0, &input_layout) != kLiteRtStatusOk) {
-      LOGE("Failed to get input layout.");
-      return;
-    }
-
-    // Dynamically check if the model wants NHWC (dim 3 is channels)
-    bool is_nhwc = (input_layout.rank == 4 && input_layout.dimensions[3] == 3);
-
-    std::vector<float> input_tensor(3 * 896 * 504);
-    for (int y = 0; y < 896; ++y) {
-      for (int x = 0; x < 504; ++x) {
-        int pixel_idx = (y * 504 + x) * 3;
-        // ImageNet Normalize
-        float r = (rgb_data[pixel_idx + 0] / 255.0f - 0.485f) / 0.229f;
-        float g = (rgb_data[pixel_idx + 1] / 255.0f - 0.456f) / 0.224f;
-        float b = (rgb_data[pixel_idx + 2] / 255.0f - 0.406f) / 0.225f;
-
-        if (is_nhwc) {
-          input_tensor[pixel_idx + 0] = r;
-          input_tensor[pixel_idx + 1] = g;
-          input_tensor[pixel_idx + 2] = b;
-        } else {
-          input_tensor[0 * 896 * 504 + y * 504 + x] = r;
-          input_tensor[1 * 896 * 504 + y * 504 + x] = g;
-          input_tensor[2 * 896 * 504 + y * 504 + x] = b;
-        }
-      }
-    }
-
-    LiteRtTensorBuffer input_buffer = nullptr;
-    LiteRtRankedTensorType input_tensor_type;
-    input_tensor_type.element_type = kLiteRtElementTypeFloat32;
-    input_tensor_type.layout = input_layout;
-
-    if (LiteRtCreateTensorBufferFromHostMemory(
-            &input_tensor_type, input_tensor.data(),
-            input_tensor.size() * sizeof(float), nullptr,
-            &input_buffer) != kLiteRtStatusOk) {
-      LOGE("Failed to create input tensor buffer.");
-      return;
-    }
-
-    LiteRtTensorBufferRequirements output_reqs;
-    if (LiteRtGetCompiledModelOutputBufferRequirements(
-            compiled_model_, 0, 0, &output_reqs) != kLiteRtStatusOk) {
-      LOGE("Failed to get output buffer requirements.");
-      LiteRtDestroyTensorBuffer(input_buffer);
-      return;
-    }
-
-    LiteRtLayout output_layout;
-    if (LiteRtGetCompiledModelOutputTensorLayouts(
-            compiled_model_, 0, 1, &output_layout, false) != kLiteRtStatusOk) {
-      LOGE("Failed to get output layout.");
-      LiteRtDestroyTensorBuffer(input_buffer);
-      return;
-    }
-
-    LiteRtRankedTensorType output_tensor_type;
-    output_tensor_type.element_type = kLiteRtElementTypeFloat32;
-    output_tensor_type.layout = output_layout;
-
-    LiteRtTensorBuffer output_buffer = nullptr;
-    if (LiteRtCreateManagedTensorBufferFromRequirements(
-            env_, &output_tensor_type, output_reqs, &output_buffer) !=
-        kLiteRtStatusOk) {
-      LOGE("Failed to create output tensor buffer.");
-      LiteRtDestroyTensorBuffer(input_buffer);
-      return;
-    }
-
-    if (LiteRtRunCompiledModel(compiled_model_, 0, 1, &input_buffer, 1,
-                               &output_buffer) != kLiteRtStatusOk) {
-      LOGE("Inference execution failed.");
-      LiteRtDestroyTensorBuffer(input_buffer);
-      LiteRtDestroyTensorBuffer(output_buffer);
-      return;
-    }
-
-    void *output_data_ptr = nullptr;
-    if (LiteRtLockTensorBuffer(output_buffer, &output_data_ptr,
-                               kLiteRtTensorBufferLockModeRead) !=
-        kLiteRtStatusOk) {
-      LOGE("Failed to lock output buffer.");
-      LiteRtDestroyTensorBuffer(input_buffer);
-      LiteRtDestroyTensorBuffer(output_buffer);
-      return;
-    }
-
-    std::vector<float> output_ai(896 * 504);
-
-    // LiteRT handles the FP16 to FP32 conversion natively if we created the
-    // buffer as Float32. However, if the underlying buffer exposes FP16 anyway,
-    // we need to check its actual type.
-    LiteRtRankedTensorType actual_output_type;
-    if (LiteRtGetTensorBufferTensorType(output_buffer, &actual_output_type) ==
-            kLiteRtStatusOk &&
-        actual_output_type.element_type == kLiteRtElementTypeFloat16) {
-      uint16_t *fp16_data = reinterpret_cast<uint16_t *>(output_data_ptr);
-
-      // Fast FP16 to FP32 conversion using standard bit-shifting
-      for (int i = 0; i < 896 * 504; ++i) {
-        uint16_t h = fp16_data[i];
-        int sign = (h >> 15) & 0x00000001;
-        int exp = (h >> 10) & 0x0000001F;
-        int frac = h & 0x000003FF;
-        float f32;
-        if (exp == 0) {
-          f32 =
-              (sign ? -1.0f : 1.0f) * std::pow(2.0f, -14.0f) * (frac / 1024.0f);
-        } else if (exp == 31) {
-          f32 = frac == 0 ? (sign ? -INFINITY : INFINITY) : NAN;
-        } else {
-          f32 = (sign ? -1.0f : 1.0f) * std::pow(2.0f, exp - 15.0f) *
-                (1.0f + frac / 1024.0f);
-        }
-        output_ai[i] = f32;
-      }
-    } else {
-      // Standard FP32 extraction
-      float *fp32_data = reinterpret_cast<float *>(output_data_ptr);
-      std::copy(fp32_data, fp32_data + (896 * 504), output_ai.begin());
-    }
-
-    LiteRtUnlockTensorBuffer(output_buffer);
-    LiteRtDestroyTensorBuffer(input_buffer);
-    LiteRtDestroyTensorBuffer(output_buffer);
-
-    // The exp() decode is already baked into the TFLite graph (DualDPT output)
-    std::vector<float> &z_ai_linear = output_ai;
-
-    // 9. C++ 2D Coordinate Mapping (Optical Center Math)
-    std::vector<Anchor> tof_anchors;
-    int depth_w = task.depth_width;
-    int depth_h = task.depth_height;
-
-    // Isotropic scale based on shared horizontal FOV
-    float scale = 896.0f / (float)depth_w;
-
-    for (int v = 0; v < depth_h; ++v) {
-      for (int u = 0; u < depth_w; ++u) {
-        int depth_idx = v * depth_w + u;
-        uint8_t confidence = task.confidence_data[depth_idx];
-
-        if (confidence >= 150) {
-          float z_metric = task.depth_data[depth_idx] / 1000.0f;
-
-          // Map from center of Depth to center of Landscape Tensor
-          float u_land = (u - depth_w / 2.0f) * scale + 448.0f;
-          float v_land = (v - depth_h / 2.0f) * scale + 252.0f;
-
-          // Rotate 90 degrees clockwise to Portrait Tensor
-          float u_ai = 504.0f - 1.0f - v_land;
-          float v_ai = u_land;
-
-          int tx = static_cast<int>(std::round(u_ai));
-          int ty = static_cast<int>(std::round(v_ai));
-
-          if (tx >= 0 && tx < 504 && ty >= 0 && ty < 896) {
-            float z_ai_lin = z_ai_linear[ty * 504 + tx];
-            tof_anchors.push_back(Anchor{u_ai, v_ai, z_ai_lin, z_metric});
-          }
-        }
-      }
-    }
-
-    std::vector<Anchor> slam_anchors;
-    std::array<float, 16> view_mat;
-    const float *m = task.pose_matrix.data();
-    view_mat[0] = m[0];
-    view_mat[4] = m[1];
-    view_mat[8] = m[2];
-    view_mat[12] = -(m[0] * m[12] + m[1] * m[13] + m[2] * m[14]);
-    view_mat[1] = m[4];
-    view_mat[5] = m[5];
-    view_mat[9] = m[6];
-    view_mat[13] = -(m[4] * m[12] + m[5] * m[13] + m[6] * m[14]);
-    view_mat[2] = m[8];
-    view_mat[6] = m[9];
-    view_mat[10] = m[10];
-    view_mat[14] = -(m[8] * m[12] + m[9] * m[13] + m[10] * m[14]);
-    view_mat[3] = 0.f;
-    view_mat[7] = 0.f;
-    view_mat[11] = 0.f;
-    view_mat[15] = 1.0f;
-
-    for (size_t i = 0; i < task.slam_points_data.size(); i += 4) {
-      float x_w = task.slam_points_data[i];
-      float y_w = task.slam_points_data[i + 1];
-      float z_w = task.slam_points_data[i + 2];
-
-      float x_s = view_mat[0] * x_w + view_mat[4] * y_w + view_mat[8] * z_w +
-                  view_mat[12];
-      float y_s = view_mat[1] * x_w + view_mat[5] * y_w + view_mat[9] * z_w +
-                  view_mat[13];
-      float z_s = view_mat[2] * x_w + view_mat[6] * y_w + view_mat[10] * z_w +
-                  view_mat[14];
-
-      float x_p = y_s;
-      float y_p = -x_s;
-      float z_p = z_s;
-
-      float z_true = -z_p;
-      if (z_true <= 0.1f)
-        continue;
-
-      float u_ai = (x_p * task.fx / z_true) + task.cx;
-      float v_ai = task.cy - (y_p * task.fy / z_true);
-
-      int tx = static_cast<int>(std::round(u_ai));
-      int ty = static_cast<int>(std::round(v_ai));
-
-      if (tx >= 0 && tx < 504 && ty >= 0 && ty < 896) {
-        float z_ai_lin = z_ai_linear[ty * 504 + tx];
-        slam_anchors.push_back(Anchor{u_ai, v_ai, z_ai_lin, z_true});
-      }
-    }
-
-    // 10. Global Calibration and Unprojection
-    float s_final, t_final;
-
-    if (calibration_frames_ < 5) {
-      RansacResult ransac = RunRansac(tof_anchors, slam_anchors);
-      if (!ransac.success) {
-        LOGI("RANSAC failed: Discarding frame due to lack of anchors or metric "
-             "scale alignment.");
-        return;
-      }
-
-      if (ransac.best_inliers < 50) {
-        LOGI("Insufficient inliers. Skipping fusion.");
-        return;
-      }
-
-      std::vector<Anchor> inlier_set;
-      for (const auto &a : tof_anchors) {
-        float z_pred = ransac.s * a.z_ai_linear + ransac.t;
-        float tol = std::max(0.05f, a.z_metric * 0.05f);
-        if (std::abs(z_pred - a.z_metric) < tol)
-          inlier_set.push_back(a);
-      }
-
-      float sum_ai = 0, sum_metric = 0, sum_ai2 = 0, sum_ai_metric = 0;
-      for (const auto &a : inlier_set) {
-        sum_ai += a.z_ai_linear;
-        sum_metric += a.z_metric;
-        sum_ai2 += a.z_ai_linear * a.z_ai_linear;
-        sum_ai_metric += a.z_ai_linear * a.z_metric;
-      }
-      int n = inlier_set.size();
-      float denominator = n * sum_ai2 - sum_ai * sum_ai;
-      float s_refit, t_refit;
-      if (denominator > 1e-5f) {
-        s_refit = (n * sum_ai_metric - sum_ai * sum_metric) / denominator;
-        t_refit = (sum_metric - s_refit * sum_ai) / n;
-      } else {
-        s_refit = ransac.s;
-        t_refit = ransac.t;
-      }
-
-      if (is_first_frame_) {
-        smoothed_s_ = s_refit;
-        smoothed_t_ = t_refit;
-        is_first_frame_ = false;
-      } else {
-        if (std::abs(s_refit - smoothed_s_) > 1.5f ||
-            std::abs(t_refit - smoothed_t_) > 1.0f) {
-          LOGI("Temporal outlier rejected during calibration.");
-          return; // Skip this frame
-        }
-        float alpha = 0.2f;
-        smoothed_s_ = (alpha * s_refit) + ((1.0f - alpha) * smoothed_s_);
-        smoothed_t_ = (alpha * t_refit) + ((1.0f - alpha) * smoothed_t_);
-      }
-
-      calibration_frames_++;
-      s_final = smoothed_s_;
-      t_final = smoothed_t_;
-
-      if (calibration_frames_ == 5) {
-        LOGI("Global Calibration locked: s=%f, t=%f", smoothed_s_, smoothed_t_);
-      }
-    } else {
-      s_final = smoothed_s_;
-      t_final = smoothed_t_;
-    }
-
-    // 11. Densification & Matrix Unprojection and Voxel Fusion
-    std::lock_guard<std::mutex> lock(data_mutex_);
-
-    float s = s_final;
-    float t = t_final;
-
-    for (int y = 0; y < 896; ++y) {
-      for (int x = 0; x < 504; ++x) {
-        int tensor_idx = y * 504 + x;
-        float z_linear_val = z_ai_linear[tensor_idx];
-        float z_true = s * z_linear_val + t;
-
-        // 1. Far-Field Truncation (Skybox Killer)
-        if (z_true < 0.1f || z_true > 3.5f)
-          continue;
-
-        // 2. Edge Discontinuity Guard (Plane Killer)
-        if (x > 0 && x < 503 && y > 0 && y < 895) {
-          float dz_dx = std::abs(z_ai_linear[tensor_idx + 1] -
-                                 z_ai_linear[tensor_idx - 1]);
-          float dz_dy = std::abs(z_ai_linear[tensor_idx + 504] -
-                                 z_ai_linear[tensor_idx - 504]);
-          if (dz_dx > 0.04f * z_linear_val || dz_dy > 0.04f * z_linear_val) {
-            continue;
-          }
-        }
-
-        // 3. Radial Soft-Blending (Seam Minimizer)
-        float nx = (x - task.cx) / task.cx;
-        float ny = (y - task.cy) / task.cy;
-        float r_sq = nx * nx + ny * ny;
-        if (r_sq > 1.0f)
-          continue;
-        float blend_weight = 1.0f - r_sq;
-
-        // Unproject into Portrait camera coordinates
-        float x_p = (x - task.cx) * z_true / task.fx;
-        float y_p = -(y - task.cy) * z_true / task.fy;
-        float z_p = -z_true;
-
-        // Rotation matching: Portrait camera coordinates to Landscape sensor
-        // coordinate frame
-        float x_s = -y_p;
-        float y_s = x_p;
-        float z_s = z_p;
-
-        // Multiply by camera pose matrix
-        float x_w = task.pose_matrix[0] * x_s + task.pose_matrix[4] * y_s +
-                    task.pose_matrix[8] * z_s + task.pose_matrix[12];
-        float y_w = task.pose_matrix[1] * x_s + task.pose_matrix[5] * y_s +
-                    task.pose_matrix[9] * z_s + task.pose_matrix[13];
-        float z_w = task.pose_matrix[2] * x_s + task.pose_matrix[6] * y_s +
-                    task.pose_matrix[10] * z_s + task.pose_matrix[14];
-
-        // Divide space into 10cm chunk coordinates
-        int64_t cx_chunk = static_cast<int64_t>(std::floor(x_w / 0.1f));
-        int64_t cy_chunk = static_cast<int64_t>(std::floor(y_w / 0.1f));
-        int64_t cz_chunk = static_cast<int64_t>(std::floor(z_w / 0.1f));
-
-        // Bit-pack 3D chunk coordinates into a lossless uint64_t key
-        uint64_t key = (((uint64_t)cx_chunk & 0x1FFFFF) << 42) |
-                       (((uint64_t)cy_chunk & 0x1FFFFF) << 21) |
-                       ((uint64_t)cz_chunk & 0x1FFFFF);
-
-        Chunk &chunk = voxel_grid_[key];
-
-        // Voxel coordinate index within the chunk at 6.25mm resolution
-        int64_t gx = static_cast<int64_t>(std::floor(x_w / 0.00625f));
-        int64_t gy = static_cast<int64_t>(std::floor(y_w / 0.00625f));
-        int64_t gz = static_cast<int64_t>(std::floor(z_w / 0.00625f));
-
-        int vx = static_cast<int>(gx - 16 * cx_chunk);
-        int vy = static_cast<int>(gy - 16 * cy_chunk);
-        int vz = static_cast<int>(gz - 16 * cz_chunk);
-
-        int voxel_index = vx * 256 + vy * 16 + vz;
-
-        // Running average update on the voxel grid
-        float r = rgb_data[tensor_idx * 3 + 0];
-        float g = rgb_data[tensor_idx * 3 + 1];
-        float b = rgb_data[tensor_idx * 3 + 2];
-
-        if (vx >= 0 && vx < 16 && vy >= 0 && vy < 16 && vz >= 0 && vz < 16) {
-          UpdateVoxel(chunk.voxels[voxel_index], x_w, y_w, z_w, r, g, b,
-                      blend_weight);
-        }
-      }
-    }
-
-    // 12. Save frame data to export list
-    export_frames_.push_back(ExportFrame{task.image_relative_path, task.fx,
-                                         task.fy, task.cx, task.cy,
-                                         task.pose_matrix});
-
-    LOGI("Processed frame successfully: %s. Total frames: %zu",
-         task.image_relative_path.c_str(), export_frames_.size());
-  }
-
-  RansacResult RunRansac(const std::vector<Anchor> &tof_anchors,
-                         const std::vector<Anchor> &slam_anchors) {
-    RansacResult result;
-    if (tof_anchors.size() < 2)
-      return result;
-
-    int best_inliers = -1;
-    float best_s = 1.0f;
-    float best_t = 0.0f;
-
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<size_t> dist_tof(0, tof_anchors.size() - 1);
-    std::uniform_int_distribution<size_t> dist_slam(
-        0, slam_anchors.empty() ? 0 : slam_anchors.size() - 1);
-
-    for (int iter = 0; iter < 500; ++iter) {
-      size_t idx1 = dist_tof(gen);
-      const auto &a1 = tof_anchors[idx1];
-
-      Anchor a2;
-      if (slam_anchors.size() > 5) {
-        size_t idx2 = dist_slam(gen);
-        a2 = slam_anchors[idx2];
-      } else {
-        size_t idx2 = dist_tof(gen);
-        if (idx1 == idx2)
-          continue;
-        a2 = tof_anchors[idx2];
-      }
-
-      float diff_ai = a2.z_ai_linear - a1.z_ai_linear;
-
-      if (std::abs(diff_ai) < 0.05f)
-        continue;
-
-      float u_diff = a1.u_ai - a2.u_ai;
-      float v_diff = a1.v_ai - a2.v_ai;
-      if ((u_diff * u_diff + v_diff * v_diff) < 400.0f)
-        continue;
-
-      float s = (a2.z_metric - a1.z_metric) / diff_ai;
-
-      if (s <= 0.01f || s > 50.0f)
-        continue;
-
-      float t = a1.z_metric - s * a1.z_ai_linear;
-
-      if (std::abs(t) > 10.0f)
-        continue;
-
-      int inliers = 0;
-      for (const auto &a : tof_anchors) {
-        float z_pred = s * a.z_ai_linear + t;
-        float tol = std::max(0.05f, a.z_metric * 0.05f);
-        if (std::abs(z_pred - a.z_metric) < tol) {
-          inliers++;
-        }
-      }
-
-      if (inliers > best_inliers) {
-        best_inliers = inliers;
-        best_s = s;
-        best_t = t;
-      }
-    }
-
-    if (best_inliers >
-        std::max(10, static_cast<int>(tof_anchors.size() * 0.05f))) {
-      result.s = best_s;
-      result.t = best_t;
-      result.best_inliers = best_inliers;
-      result.success = true;
-    }
-
-    return result;
-  }
-
-  void UpdateVoxel(Voxel &v, float x, float y, float z, float r, float g,
-                   float b, float weight) {
-    if (!v.occupied) {
-      v.x = x;
-      v.y = y;
-      v.z = z;
-      v.r = r;
-      v.g = g;
-      v.b = b;
-      v.weight = weight;
-      v.occupied = true;
-      if (v.weight >= 3.0f) {
-        total_point_count_.fetch_add(1, std::memory_order_relaxed);
-      }
-    } else {
-      float new_weight = v.weight + weight;
-      if (v.weight < 3.0f && new_weight >= 3.0f) {
-        total_point_count_.fetch_add(1, std::memory_order_relaxed);
-      }
-      v.x = (v.x * v.weight + x * weight) / new_weight;
-      v.y = (v.y * v.weight + y * weight) / new_weight;
-      v.z = (v.z * v.weight + z * weight) / new_weight;
-      v.r = (v.r * v.weight + r * weight) / new_weight;
-      v.g = (v.g * v.weight + g * weight) / new_weight;
-      v.b = (v.b * v.weight + b * weight) / new_weight;
-      v.weight = new_weight;
-    }
-  }
-
-  std::string model_path_;
-
-  // Threading
-  std::thread worker_thread_;
-  std::mutex queue_mutex_;
-  std::condition_variable queue_cv_;
-  std::queue<FrameTask> task_queue_;
-  bool stop_worker_ = false;
-  bool start_compute_ = false;
-
-  // Voxel grid and frame list
-  std::mutex data_mutex_;
-  std::unordered_map<uint64_t, Chunk> voxel_grid_;
-  std::atomic<int> total_point_count_{0};
-  std::vector<ExportFrame> export_frames_;
-
-  bool is_first_frame_ = true;
-  int calibration_frames_ = 0;
-  float smoothed_s_ = 1.0f;
-  float smoothed_t_ = 0.0f;
-
-  // LiteRT
-  LiteRtEnvironment env_ = nullptr;
-  LiteRtModel model_ = nullptr;
-  LiteRtOptions options_ = nullptr;
-  LiteRtCompiledModel compiled_model_ = nullptr;
+  std::atomic<bool> cancel_{false};
+  std::atomic<int> current_phase_{0};
+  std::unique_ptr<FeatureExtractor> extractor_;
+  std::unique_ptr<MatchCuller> culler_;
+  std::unique_ptr<FeatureMatcher> matcher_;
+  std::unique_ptr<Triangulator> triangulator_;
+  std::unique_ptr<BundleAdjuster> bundle_adjuster_;
+  std::unique_ptr<Exporter> exporter_;
+  std::atomic<int> point_count_{0};
+  std::mutex process_mutex_;
 };
 
-// Global Pipeline Reference
-static std::unique_ptr<SplatCapturePipeline> g_pipeline = nullptr;
-
+// Removed g_pipeline
 extern "C" JNIEXPORT jlong JNICALL
 Java_io_github_sceneview_demo_demos_SplatCapturePipeline_initPipeline(
     JNIEnv *env, jobject thiz, jstring model_path) {
@@ -975,18 +296,32 @@ Java_io_github_sceneview_demo_demos_SplatCapturePipeline_initPipeline(
   std::string model_path_str(path_chars);
   env->ReleaseStringUTFChars(model_path, path_chars);
 
-  g_pipeline = std::make_unique<SplatCapturePipeline>(model_path_str);
-  return reinterpret_cast<jlong>(g_pipeline.get());
+  SplatCapturePipeline* pipeline = new SplatCapturePipeline(model_path_str);
+  return reinterpret_cast<jlong>(pipeline);
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_io_github_sceneview_demo_demos_SplatCapturePipeline_freePipeline(
     JNIEnv *env, jobject thiz, jlong handle) {
-  if (g_pipeline) {
-    g_pipeline.reset();
+  SplatCapturePipeline* pipeline = reinterpret_cast<SplatCapturePipeline*>(handle);
+  if (pipeline) {
+    delete pipeline;
   }
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_io_github_sceneview_demo_demos_SplatCapturePipeline_processDataset(
+    JNIEnv *env, jobject thiz, jlong handle, jstring manifest_path) {
+  SplatCapturePipeline* pipeline = reinterpret_cast<SplatCapturePipeline*>(handle);
+  if (!pipeline) return;
+  const char *path_chars = env->GetStringUTFChars(manifest_path, nullptr);
+  std::string path_str(path_chars);
+  env->ReleaseStringUTFChars(manifest_path, path_chars);
+  
+  pipeline->ProcessDataset(path_str);
+}
+
+// Temporary processFrame to keep it compiling while Kotlin is updated
 extern "C" JNIEXPORT jboolean JNICALL
 Java_io_github_sceneview_demo_demos_SplatCapturePipeline_processFrame(
     JNIEnv *env, jobject thiz, jlong handle, jobject y_buf, jint y_row_stride,
@@ -996,145 +331,58 @@ Java_io_github_sceneview_demo_demos_SplatCapturePipeline_processFrame(
     jobject point_cloud_buf, jint point_count, jfloatArray pose_matrix,
     jfloat fx, jfloat fy, jfloat cx, jfloat cy, jstring image_file_path,
     jstring image_relative_path) {
-  auto *pipeline = reinterpret_cast<SplatCapturePipeline *>(handle);
-  if (!pipeline)
-    return JNI_FALSE;
-
-  // Synchronously copy all direct buffers into std::vectors
-  FrameTask task;
-  task.width = width;
-  task.height = height;
-  task.y_stride = y_row_stride;
-  task.u_stride = u_row_stride;
-  task.u_pixel_stride = u_pixel_stride;
-  task.v_stride = v_row_stride;
-  task.v_pixel_stride = v_pixel_stride;
-
-  uint8_t *y_addr =
-      reinterpret_cast<uint8_t *>(env->GetDirectBufferAddress(y_buf));
-  uint8_t *u_addr =
-      reinterpret_cast<uint8_t *>(env->GetDirectBufferAddress(u_buf));
-  uint8_t *v_addr =
-      reinterpret_cast<uint8_t *>(env->GetDirectBufferAddress(v_buf));
-
-  // Android YUV420 Image sizes: Y size = width * height, U/V sizes depend on
-  // strides and layout. Copy the raw plane buffers safely based on layout
-  jlong y_cap = env->GetDirectBufferCapacity(y_buf);
-  task.y_data.assign(y_addr, y_addr + y_cap);
-
-  // Since U/V planes are typically sub-sampled by 2, their row height is height
-  // / 2. Stride extends to cover row padding.
-  jlong u_cap = env->GetDirectBufferCapacity(u_buf);
-  task.u_data.assign(u_addr, u_addr + u_cap);
-
-  jlong v_cap = env->GetDirectBufferCapacity(v_buf);
-  task.v_data.assign(v_addr, v_addr + v_cap);
-
-  // Copy Raw Depth & Confidence data
-  task.depth_width = depth_width;
-  task.depth_height = depth_height;
-  uint16_t *depth_addr =
-      reinterpret_cast<uint16_t *>(env->GetDirectBufferAddress(depth_buf));
-  task.depth_data.assign(depth_addr, depth_addr + depth_width * depth_height);
-
-  uint8_t *conf_addr =
-      reinterpret_cast<uint8_t *>(env->GetDirectBufferAddress(conf_buf));
-  task.confidence_data.assign(conf_addr,
-                              conf_addr + depth_width * depth_height);
-
-  if (point_cloud_buf != nullptr && point_count > 0) {
-    float *point_cloud_addr =
-        reinterpret_cast<float *>(env->GetDirectBufferAddress(point_cloud_buf));
-    task.slam_points_data.assign(point_cloud_addr,
-                                 point_cloud_addr + point_count * 4);
-  }
-
-  // Copy Pose Matrix (16 float array)
-  jfloat *pose_elements = env->GetFloatArrayElements(pose_matrix, nullptr);
-  std::copy(pose_elements, pose_elements + 16, task.pose_matrix.begin());
-  env->ReleaseFloatArrayElements(pose_matrix, pose_elements, JNI_ABORT);
-
-  task.fx = fx;
-  task.fy = fy;
-  task.cx = cx;
-  task.cy = cy;
-
-  const char *path_chars = env->GetStringUTFChars(image_file_path, nullptr);
-  task.image_file_path = std::string(path_chars);
-  env->ReleaseStringUTFChars(image_file_path, path_chars);
-
-  const char *rel_chars = env->GetStringUTFChars(image_relative_path, nullptr);
-  task.image_relative_path = std::string(rel_chars);
-  env->ReleaseStringUTFChars(image_relative_path, rel_chars);
-
-  pipeline->EnqueueFrame(std::move(task));
+  // OBSOLETE: To be replaced by processDataset
   return JNI_TRUE;
 }
 
 extern "C" JNIEXPORT jint JNICALL
 Java_io_github_sceneview_demo_demos_SplatCapturePipeline_getPointCount(
     JNIEnv *env, jobject thiz, jlong handle) {
-  auto *pipeline = reinterpret_cast<SplatCapturePipeline *>(handle);
-  if (!pipeline)
-    return 0;
-  return pipeline->GetPointCount();
+  SplatCapturePipeline* pipeline = reinterpret_cast<SplatCapturePipeline*>(handle);
+  if (pipeline) return pipeline->GetPointCount();
+  return 0;
 }
 
-extern "C" JNIEXPORT void JNICALL
-Java_io_github_sceneview_demo_demos_SplatCapturePipeline_exportDataset(
-    JNIEnv *env, jobject thiz, jlong handle, jstring output_dir) {
-  auto *pipeline = reinterpret_cast<SplatCapturePipeline *>(handle);
-  if (!pipeline)
-    return;
-
-  const char *dir_chars = env->GetStringUTFChars(output_dir, nullptr);
-  std::string output_dir_str(dir_chars);
-  env->ReleaseStringUTFChars(output_dir, dir_chars);
-
-  pipeline->ExportDataset(output_dir_str);
-}
+// Removed exportDataset
 
 extern "C" JNIEXPORT void JNICALL
 Java_io_github_sceneview_demo_demos_SplatCapturePipeline_startDepthGeneration(
     JNIEnv *env, jobject thiz, jlong handle) {
-  auto *pipeline = reinterpret_cast<SplatCapturePipeline *>(handle);
-  if (!pipeline)
-    return;
-  pipeline->StartCompute();
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_io_github_sceneview_demo_demos_SplatCapturePipeline_clearPipeline(
     JNIEnv *env, jobject thiz, jlong handle) {
-  auto *pipeline = reinterpret_cast<SplatCapturePipeline *>(handle);
-  if (!pipeline)
-    return;
-  pipeline->Clear();
+  SplatCapturePipeline* pipeline = reinterpret_cast<SplatCapturePipeline*>(handle);
+  if (pipeline) pipeline->Clear();
 }
 
 extern "C" JNIEXPORT jint JNICALL
 Java_io_github_sceneview_demo_demos_SplatCapturePipeline_getPendingFrames(
     JNIEnv *env, jobject thiz, jlong handle) {
-  auto *pipeline = reinterpret_cast<SplatCapturePipeline *>(handle);
-  if (!pipeline)
-    return 0;
-  return pipeline->GetPendingFramesCount();
+  SplatCapturePipeline* pipeline = reinterpret_cast<SplatCapturePipeline*>(handle);
+  if (pipeline) return pipeline->GetPendingFramesCount();
+  return 0;
 }
 
 extern "C" JNIEXPORT jint JNICALL
 Java_io_github_sceneview_demo_demos_SplatCapturePipeline_getProcessedFrames(
     JNIEnv *env, jobject thiz, jlong handle) {
-  auto *pipeline = reinterpret_cast<SplatCapturePipeline *>(handle);
-  if (!pipeline)
-    return 0;
-  return pipeline->GetProcessedFramesCount();
+  SplatCapturePipeline* pipeline = reinterpret_cast<SplatCapturePipeline*>(handle);
+  if (pipeline) return pipeline->GetProcessedFramesCount();
+  return 0;
 }
 
 extern "C" JNIEXPORT jint JNICALL
 Java_io_github_sceneview_demo_demos_SplatCapturePipeline_getGpuStatus(
     JNIEnv *env, jobject thiz, jlong handle) {
-  auto *pipeline = reinterpret_cast<SplatCapturePipeline *>(handle);
-  if (!pipeline)
-    return 0;
-  return pipeline->is_gpu_enabled_;
+  return 1; // Fake GPU status
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_io_github_sceneview_demo_demos_SplatCapturePipeline_getProcessingPhase(
+    JNIEnv *env, jobject thiz, jlong handle) {
+  SplatCapturePipeline* pipeline = reinterpret_cast<SplatCapturePipeline*>(handle);
+  if (pipeline) return pipeline->GetProcessingPhase();
+  return 0;
 }

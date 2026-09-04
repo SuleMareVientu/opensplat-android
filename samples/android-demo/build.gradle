@@ -314,6 +314,22 @@ dependencies {
     implementation 'com.google.ai.edge.litert:litert:2.1.6'
 }
 
+task downloadXFeatModel {
+    def modelFile = file("src/main/assets/xfeat_fp16.tflite")
+    outputs.file(modelFile)
+
+    doLast {
+        if (!modelFile.exists()) {
+            logger.lifecycle("Downloading xfeat_fp16.tflite model from Hugging Face...")
+            modelFile.parentFile.mkdirs()
+            new URL("https://huggingface.co/litert-community/xfeat-litert/resolve/main/xfeat_fp16.tflite").withInputStream { i ->
+                modelFile.withOutputStream { it << i }
+            }
+            logger.lifecycle("✅ Downloaded xfeat_fp16.tflite successfully.")
+        }
+    }
+}
+
 // ─── Generated demo registry (issue #1976) ───────────────────────────────
 //
 // `GeneratedDemos.kt` is the collated output of the append-only DemoRegistry
@@ -525,4 +541,5 @@ tasks.matching { it.name.startsWith("compile") && it.name.endsWith("Kotlin") }.c
 }
 tasks.matching { it.name == "preBuild" }.configureEach {
     dependsOn(generateDemoRegistry)
+    dependsOn(downloadXFeatModel)
 }
