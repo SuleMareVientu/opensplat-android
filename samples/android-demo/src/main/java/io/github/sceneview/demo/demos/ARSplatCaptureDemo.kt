@@ -26,6 +26,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -33,6 +34,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -75,6 +77,8 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.math.sqrt
+import io.github.sceneview.demo.demos.internal.CheapGeometricFilter
+import io.github.sceneview.demo.demos.internal.PriorConditionedSplatPipeline
 
 @Serializable
 data class NerfstudioTransform(
@@ -95,42 +99,28 @@ data class NerfstudioFrame(
     val transform_matrix: List<List<Float>>
 )
 
-class PointData(
-    var x: Float,
-    var y: Float,
-    var z: Float,
-    var r: Int,
-    var g: Int,
-    var b: Int,
-    var observations: Int = 1,
-    var isHighAccuracy: Boolean = true,
-    var distance: Float = 0f,
-    var textureVariance: Float = 0f,
-    var voxelKey: Long = 0L
-)
-
 class PrimitivePointList(initialCapacity: Int = 5000) {
     var size = 0
         private set
     var xyz = FloatArray(initialCapacity * 3)
     var rgb = ByteArray(initialCapacity * 3)
-    var highAccuracy = BooleanArray(initialCapacity)
+    var confidence = FloatArray(initialCapacity)
     var distance = FloatArray(initialCapacity)
     var textureVariance = FloatArray(initialCapacity)
 
-    fun add(x: Float, y: Float, z: Float, r: Int, g: Int, b: Int, highAcc: Boolean, dist: Float, variance: Float) {
+    fun add(x: Float, y: Float, z: Float, r: Int, g: Int, b: Int, conf: Float, dist: Float, variance: Float) {
         if (size >= xyz.size / 3) {
             val newCap = size * 2
             xyz = xyz.copyOf(newCap * 3)
             rgb = rgb.copyOf(newCap * 3)
-            highAccuracy = highAccuracy.copyOf(newCap)
+            confidence = confidence.copyOf(newCap)
             distance = distance.copyOf(newCap)
             textureVariance = textureVariance.copyOf(newCap)
         }
         val idx3 = size * 3
         xyz[idx3] = x; xyz[idx3 + 1] = y; xyz[idx3 + 2] = z
         rgb[idx3] = r.toByte(); rgb[idx3 + 1] = g.toByte(); rgb[idx3 + 2] = b.toByte()
-        highAccuracy[size] = highAcc
+        confidence[size] = conf
         distance[size] = dist
         textureVariance[size] = variance
         size++
@@ -142,13 +132,13 @@ class PrimitivePointList(initialCapacity: Int = 5000) {
             val newCap = Math.max(xyz.size / 3 * 2, newSize)
             xyz = xyz.copyOf(newCap * 3)
             rgb = rgb.copyOf(newCap * 3)
-            highAccuracy = highAccuracy.copyOf(newCap)
+            confidence = confidence.copyOf(newCap)
             distance = distance.copyOf(newCap)
             textureVariance = textureVariance.copyOf(newCap)
         }
         System.arraycopy(other.xyz, 0, xyz, size * 3, other.size * 3)
         System.arraycopy(other.rgb, 0, rgb, size * 3, other.size * 3)
-        System.arraycopy(other.highAccuracy, 0, highAccuracy, size, other.size)
+        System.arraycopy(other.confidence, 0, confidence, size, other.size)
         System.arraycopy(other.distance, 0, distance, size, other.size)
         System.arraycopy(other.textureVariance, 0, textureVariance, size, other.size)
         size = newSize
@@ -187,15 +177,6 @@ class IntHashSet(initialCapacity: Int) {
     }
 }
 
-class OccupancyVoxel {
-    val frames = HashSet<Int>()
-    var hasHighAccuracy = false
-    var rSum = 0
-    var gSum = 0
-    var bSum = 0
-    var highAccCount = 0
-}
-
 data class CapturedFrameData(
     val anchor: Anchor,
     val filePath: String,
@@ -230,28 +211,6 @@ object ShortArrayPool {
     }
 }
 
-private fun packVoxel(x: Int, y: Int, z: Int): Long {
-    val mask = 0x1FFFFFL
-    return ((x.toLong() and mask) shl 42) or
-           ((y.toLong() and mask) shl 21) or
-           (z.toLong() and mask)
-}
-
-private fun unpackX(packed: Long): Int {
-    val x21 = (packed shr 42) and 0x1FFFFFL
-    return if (x21 >= 0x100000L) (x21 - 0x200000L).toInt() else x21.toInt()
-}
-
-private fun unpackY(packed: Long): Int {
-    val y21 = (packed shr 21) and 0x1FFFFFL
-    return if (y21 >= 0x100000L) (y21 - 0x200000L).toInt() else y21.toInt()
-}
-
-private fun unpackZ(packed: Long): Int {
-    val z21 = packed and 0x1FFFFFL
-    return if (z21 >= 0x100000L) (z21 - 0x200000L).toInt() else z21.toInt()
-}
-
 @Suppress("NOTHING_TO_INLINE")
 private inline fun fastRound(value: Float): Int {
     return if (value >= 0f) (value + 0.5f).toInt() else (value - 0.5f).toInt()
@@ -272,6 +231,7 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
 
     var isCapturing by remember { mutableStateOf(false) }
     var isExporting by remember { mutableStateOf(false) }
+    var exportProgress by remember { mutableFloatStateOf(0f) }
     var isAutoFocus by remember { mutableStateOf(true) }
     var arSession by remember { mutableStateOf<com.google.ar.core.Session?>(null) }
     var targetResolutionIdx by remember { mutableStateOf(1f) } // Default to 720p
@@ -433,6 +393,7 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                     onClick = {
                         if (isExporting || capturedFrames.isEmpty()) return@Button
                         isExporting = true
+                        exportProgress = 0.01f
                         coroutineScope.launch(Dispatchers.IO) {
                             try {
                                 // Wait for all active background accumulation jobs to finish
@@ -456,16 +417,49 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                                 jsonFile.writeText(json.encodeToString(nerfstudioData))
 
                                 val plyFile = File(tempDir, "points.ply")
-                                writePlyVoxelFiltered(capturedFrames, plyFile)
+                                PriorConditionedSplatPipeline.processAndExport(
+                                    frames = capturedFrames,
+                                    tempDir = tempDir,
+                                    outputPlyFile = plyFile,
+                                    imageWidth = lastW,
+                                    imageHeight = lastH,
+                                    onKeyframesUpdated = { updatedKeyframes ->
+                                        // Rewrite transforms.json with drift-free BA-refined camera poses
+                                        val updatedFramesList = capturedFrames.mapIndexed { idx, data ->
+                                            val kf = updatedKeyframes.getOrNull(idx)
+                                            val matrix = kf?.cameraToWorld ?: run {
+                                                val m = FloatArray(16)
+                                                data.anchor.pose.toMatrix(m, 0)
+                                                m
+                                            }
+                                            val transformMatrix = listOf(
+                                                listOf(matrix[0], matrix[4], matrix[8], matrix[12]),
+                                                listOf(matrix[1], matrix[5], matrix[9], matrix[13]),
+                                                listOf(matrix[2], matrix[6], matrix[10], matrix[14]),
+                                                listOf(matrix[3], matrix[7], matrix[11], matrix[15])
+                                            )
+                                            NerfstudioFrame(data.filePath, data.fl_x, data.fl_y, data.cx, data.cy, transformMatrix)
+                                        }
+                                        val updatedNerfstudioData = NerfstudioTransform(w = lastW, h = lastH, frames = updatedFramesList)
+                                        jsonFile.writeText(json.encodeToString(updatedNerfstudioData))
+                                    },
+                                    onProgress = { p -> exportProgress = p }
+                                )
                                 val zipFile = File(context.cacheDir, "export.zip")
-                                zip(tempDir, zipFile)
+                                zip(tempDir, zipFile) { zipFrac ->
+                                    exportProgress = 0.85f + 0.15f * zipFrac
+                                }
                                 withContext(Dispatchers.Main) {
+                                    exportProgress = 1.0f
                                     zipLauncher.launch("splat_dataset.zip")
                                 }
                             } catch (e: Exception) {
                                 // Ignore or log
                             } finally {
-                                withContext(Dispatchers.Main) { isExporting = false }
+                                withContext(Dispatchers.Main) {
+                                    isExporting = false
+                                    exportProgress = 0f
+                                }
                             }
                         }
                     },
@@ -473,13 +467,17 @@ fun ArSplatCaptureDemo(onBack: () -> Unit) {
                     modifier = Modifier.weight(1f)
                 ) {
                     if (isExporting) {
-                        androidx.compose.material3.CircularProgressIndicator(
+                        CircularProgressIndicator(
+                            progress = { exportProgress },
                             modifier = Modifier.size(20.dp),
-                            color = androidx.compose.material3.MaterialTheme.colorScheme.onPrimary,
-                            strokeWidth = 2.dp
+                            color = MaterialTheme.colorScheme.onPrimary,
+                            trackColor = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.25f),
+                            strokeWidth = 2.5.dp
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Exporting...")
+                        Text(
+                            text = if (exportProgress > 0f) "Exporting ${(exportProgress * 100).toInt()}%" else "Exporting..."
+                        )
                     } else {
                         Icon(Icons.Default.Save, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
@@ -656,10 +654,36 @@ private fun accumulateHybridPointCloudBackground(
                         val conf = ca[depthIdx].toInt() and 0xFF
                         val smoothDepthMm = sda?.get(depthIdx)?.toInt()?.and(0xFFFF) ?: 0
 
-                        var depthMm = 0; var isHighAccuracy = false
-                        if (rawDepthMm in 1..4000 && conf >= 230) { depthMm = rawDepthMm; isHighAccuracy = true }
-                        else if (smoothDepthMm in 1..4000) { depthMm = smoothDepthMm; isHighAccuracy = false }
-                        if (depthMm == 0) continue
+                        val colorU = (u * scaleU).toInt().coerceIn(0, colorWidth - 1)
+                        val colorV = (v * scaleV).toInt().coerceIn(0, colorHeight - 1)
+                        val variance = getTextureGradientFromNv21(cn, colorWidth, colorHeight, colorU, colorV)
+
+                        var depthMm = 0
+                        var continuousConf = 0f
+
+                        if (rawDepthMm in 1..4000 && conf > 0) {
+                            val c = CheapGeometricFilter.filterEdgeAndNormalizeConfidence(
+                                u = u,
+                                v = v,
+                                rawDepthMm = rawDepthMm,
+                                confByte = conf,
+                                depthWidth = depthWidth,
+                                depthHeight = depthHeight,
+                                rawDepthArray = rda,
+                                luminanceGradient = variance
+                            )
+                            if (c > 0f) {
+                                depthMm = rawDepthMm
+                                continuousConf = c
+                            }
+                        }
+
+                        if (depthMm == 0 && smoothDepthMm in 1..4000) {
+                            depthMm = smoothDepthMm
+                            continuousConf = 0.25f
+                        }
+
+                        if (depthMm == 0 || continuousConf <= 0f) continue
 
                         val zCam = depthMm / 1000f
                         val xCam = (u - cx) * zCam / fx
@@ -670,13 +694,10 @@ private fun accumulateHybridPointCloudBackground(
                         val yAnchor = localToAnchorMatrix[1] * xCam + localToAnchorMatrix[5] * yCam + localToAnchorMatrix[9] * zCamCoord + localToAnchorMatrix[13]
                         val zAnchor = localToAnchorMatrix[2] * xCam + localToAnchorMatrix[6] * yCam + localToAnchorMatrix[10] * zCamCoord + localToAnchorMatrix[14]
 
-                        val colorU = (u * scaleU).toInt().coerceIn(0, colorWidth - 1)
-                        val colorV = (v * scaleV).toInt().coerceIn(0, colorHeight - 1)
                         val color = getPixelColorFromNv21(cn, colorWidth, colorHeight, colorU, colorV)
                         val r = (color shr 16) and 0xFF
                         val g = (color shr 8) and 0xFF
                         val b = color and 0xFF
-                        val variance = getTextureGradientFromNv21(cn, colorWidth, colorHeight, colorU, colorV)
 
                         val textureMultiplier = if (variance < 10f) 4f else if (variance < 30f) 2f else 1f
                         val localVoxelSize = (zCam * 0.01f * textureMultiplier).coerceIn(0.002f, 0.05f)
@@ -685,7 +706,7 @@ private fun accumulateHybridPointCloudBackground(
                         val vz = fastRound(zAnchor / localVoxelSize)
                         val hash = (vx * 73856093) xor (vy * 19349663) xor (vz * 83492791)
                         if (!voxelGrid.add(hash)) continue
-                        newPoints.add(xAnchor, yAnchor, zAnchor, r, g, b, isHighAccuracy, zCam, variance)
+                        newPoints.add(xAnchor, yAnchor, zAnchor, r, g, b, continuousConf, zCam, variance)
                     }
                 }
                 withContext(Dispatchers.Main) {
@@ -714,133 +735,7 @@ private fun accumulateHybridPointCloudBackground(
     }
 }
 
-private fun writePlyVoxelFiltered(frames: List<CapturedFrameData>, file: File) {
-    val occupancyGrid = HashMap<Long, OccupancyVoxel>()
-    val occupancyVoxelSize = 0.02f
-    frames.forEachIndexed { frameIndex, frameData ->
-        val anchorMatrix = FloatArray(16); frameData.anchor.pose.toMatrix(anchorMatrix, 0)
-        val pts = frameData.localPoints
-        for (i in 0 until pts.size) {
-            val i3 = i * 3
-            val px = pts.xyz[i3]; val py = pts.xyz[i3+1]; val pz = pts.xyz[i3+2]
-            val pHighAcc = pts.highAccuracy[i]
-            val pr = pts.rgb[i3].toInt() and 0xFF; val pg = pts.rgb[i3+1].toInt() and 0xFF; val pb = pts.rgb[i3+2].toInt() and 0xFF
 
-            val xWorld = anchorMatrix[0] * px + anchorMatrix[4] * py + anchorMatrix[8] * pz + anchorMatrix[12]
-            val yWorld = anchorMatrix[1] * px + anchorMatrix[5] * py + anchorMatrix[9] * pz + anchorMatrix[13]
-            val zWorld = anchorMatrix[2] * px + anchorMatrix[6] * py + anchorMatrix[10] * pz + anchorMatrix[14]
-            
-            val vx = fastRound(xWorld / occupancyVoxelSize)
-            val vy = fastRound(yWorld / occupancyVoxelSize)
-            val vz = fastRound(zWorld / occupancyVoxelSize)
-            val coord = packVoxel(vx, vy, vz)
-            
-            val voxel = occupancyGrid.getOrPut(coord) { OccupancyVoxel() }
-            voxel.frames.add(frameIndex)
-            if (pHighAcc) {
-                voxel.hasHighAccuracy = true; voxel.rSum += pr; voxel.gSum += pg; voxel.bSum += pb; voxel.highAccCount++
-            }
-        }
-    }
-    
-    val populatedVoxels = HashMap<Long, Int>() // Store packed RGB color
-    occupancyGrid.forEach { (coord, voxel) ->
-        if (voxel.hasHighAccuracy && voxel.highAccCount > 0) {
-            val rAvg = voxel.rSum / voxel.highAccCount
-            val gAvg = voxel.gSum / voxel.highAccCount
-            val bAvg = voxel.bSum / voxel.highAccCount
-            populatedVoxels[coord] = (rAvg shl 16) or (gAvg shl 8) or bAvg
-        }
-    }
-    
-    val finalPoints = HashMap<Int, PointData>()
-    frames.forEach { frameData ->
-        val anchorMatrix = FloatArray(16); frameData.anchor.pose.toMatrix(anchorMatrix, 0)
-        val pts = frameData.localPoints
-        for (i in 0 until pts.size) {
-            val i3 = i * 3
-            val px = pts.xyz[i3]; val py = pts.xyz[i3+1]; val pz = pts.xyz[i3+2]
-            val pr = pts.rgb[i3].toInt() and 0xFF; val pg = pts.rgb[i3+1].toInt() and 0xFF; val pb = pts.rgb[i3+2].toInt() and 0xFF
-            val pHighAcc = pts.highAccuracy[i]
-            val pDist = pts.distance[i]
-            val pVar = pts.textureVariance[i]
-
-            val xWorld = anchorMatrix[0] * px + anchorMatrix[4] * py + anchorMatrix[8] * pz + anchorMatrix[12]
-            val yWorld = anchorMatrix[1] * px + anchorMatrix[5] * py + anchorMatrix[9] * pz + anchorMatrix[13]
-            val zWorld = anchorMatrix[2] * px + anchorMatrix[6] * py + anchorMatrix[10] * pz + anchorMatrix[14]
-            
-            val vx = fastRound(xWorld / occupancyVoxelSize)
-            val vy = fastRound(yWorld / occupancyVoxelSize)
-            val vz = fastRound(zWorld / occupancyVoxelSize)
-            val coord = packVoxel(vx, vy, vz)
-            
-            if (!pHighAcc) {
-                val refColor = populatedVoxels[coord] ?: continue
-                val refR = (refColor shr 16) and 0xFF
-                val refG = (refColor shr 8) and 0xFF
-                val refB = refColor and 0xFF
-                val rDiff = pr - refR; val gDiff = pg - refG; val bDiff = pb - refB
-                if (sqrt((rDiff*rDiff + gDiff*gDiff + bDiff*bDiff).toDouble()) > 60.0) continue
-                if ((occupancyGrid[coord]?.frames?.size ?: 0) < 2) continue
-            }
-            val textureMultiplier = if (pVar < 10f) 4f else if (pVar < 30f) 2f else 1f
-            val res = (pDist * 0.01f * textureMultiplier).coerceIn(0.002f, 0.05f)
-            val hash = (fastRound(xWorld / res) * 73856093) xor (fastRound(yWorld / res) * 19349663) xor (fastRound(zWorld / res) * 83492791)
-            val existing = finalPoints[hash]
-            if (existing == null) finalPoints[hash] = PointData(xWorld, yWorld, zWorld, pr, pg, pb, 1, pHighAcc, pDist, pVar)
-            else { val n = existing.observations; existing.r = (existing.r * n + pr) / (n + 1); existing.g = (existing.g * n + pg) / (n + 1); existing.b = (existing.b * n + pb) / (n + 1); existing.observations++ }
-        }
-    }
-    
-    val exportedPoints = finalPoints.values.toList()
-    val outlierGrid = HashMap<Long, Int>()
-    exportedPoints.forEach { p ->
-        val coord = packVoxel(fastRound(p.x / 0.02f), fastRound(p.y / 0.02f), fastRound(p.z / 0.02f))
-        p.voxelKey = coord
-        outlierGrid[coord] = (outlierGrid[coord] ?: 0) + 1
-    }
-    
-    val validVoxels = HashSet<Long>()
-    outlierGrid.forEach { (coord, count) ->
-        val cx = unpackX(coord)
-        val cy = unpackY(coord)
-        val cz = unpackZ(coord)
-        var neighbors = count
-        for (dx in -1..1) {
-            for (dy in -1..1) {
-                for (dz in -1..1) {
-                    if (dx == 0 && dy == 0 && dz == 0) continue
-                    val neighborCoord = packVoxel(cx + dx, cy + dy, cz + dz)
-                    neighbors += outlierGrid[neighborCoord] ?: 0
-                }
-            }
-        }
-        if (neighbors >= 3) {
-            validVoxels.add(coord)
-        }
-    }
-    
-    val finalCleanPoints = exportedPoints.filter { p ->
-        p.voxelKey in validVoxels
-    }
-    
-    file.outputStream().buffered().use { out ->
-        val header = "ply\nformat binary_little_endian 1.0\nelement vertex ${finalCleanPoints.size}\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n"
-        out.write(header.toByteArray(Charsets.US_ASCII))
-        
-        val buffer = java.nio.ByteBuffer.allocate(15).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        finalCleanPoints.forEach { p ->
-            buffer.clear()
-            buffer.putFloat(p.x)
-            buffer.putFloat(p.y)
-            buffer.putFloat(p.z)
-            buffer.put(p.r.toByte())
-            buffer.put(p.g.toByte())
-            buffer.put(p.b.toByte())
-            out.write(buffer.array(), 0, 15)
-        }
-    }
-}
 
 private fun captureFrameBackground(
     frame: Frame,
@@ -976,7 +871,11 @@ private fun copyBytePlane(plane: Image.Plane, width: Int, height: Int): ByteArra
     return result
 }
 
-private fun zip(directory: File, zipFile: File) {
+private fun zip(directory: File, zipFile: File, onProgress: ((Float) -> Unit)? = null) {
+    val fileList = directory.walkTopDown().filter { it.isFile }.toList()
+    val totalFiles = fileList.size.coerceAtLeast(1)
+    var filesProcessed = 0
+
     ZipOutputStream(BufferedOutputStream(FileOutputStream(zipFile))).use { zos ->
         directory.walkTopDown().forEach { file ->
             val zipFileName = file.absolutePath.removePrefix(directory.absolutePath).removePrefix(File.separator)
@@ -985,6 +884,8 @@ private fun zip(directory: File, zipFile: File) {
                 zos.putNextEntry(entry)
                 if (file.isFile) {
                     file.inputStream().use { it.copyTo(zos) }
+                    filesProcessed++
+                    onProgress?.invoke(filesProcessed.toFloat() / totalFiles)
                 }
             }
         }
