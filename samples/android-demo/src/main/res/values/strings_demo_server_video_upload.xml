@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="demo_server_video_upload">Server Video Upload</string>
+    <string name="demo_server_video_upload_subtitle">Upload MP4 video to OpenSplat server for 3D reconstruction</string>
+    <string name="demo_server_video_upload_server_url">Server URL</string>
+    <string name="demo_server_video_upload_test_connection">Test</string>
+    <string name="demo_server_video_upload_select_video">Select MP4 Video</string>
+    <string name="demo_server_video_upload_upload_button">Upload Video to Server</string>
+    <string name="demo_server_video_upload_status">Status: %s</string>
+    <string name="demo_server_video_upload_start_training">Start Training</string>
+    <string name="demo_server_video_upload_stop_training">Stop Job</string>
+    <string name="demo_server_video_upload_download_model">Download Model (.ply)</string>
+    <string name="demo_server_video_upload_delete_job">Delete Job</string>
+    <string name="demo_server_video_upload_refresh_jobs">Refresh Jobs</string>
+</resources>

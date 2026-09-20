@@ -1,0 +1,364 @@
+# OpenSplat Server API Specification
+
+This document details all the API endpoints provided by the OpenSplat Server.
+This is meant for a mobile developer or mobile agent to implement integration.
+
+## General Information
+- **Default Server Port**: 8000
+- **Base API Path**: /api (All endpoints except the root status check are prefixed with `/api`)
+- **Default Base URL**: http://<server_ip>:8000
+
+---
+
+## 1. Service Status Check
+Check if the OpenSplat API Server is running.
+
+- **URL**: `/`
+- **Method**: `GET`
+- **Headers**: `None`
+- **Parameters**: `None`
+- **Response**: `200 OK`
+  - **Body (JSON)**:
+    ```json
+    {
+      "status": "running",
+      "service": "OpenSplat API Server"
+    }
+    ```
+
+---
+
+## 2. Upload Video
+Upload a video file to create a new reconstruction and training job.
+
+- **URL**: `/api/upload/video`
+- **Method**: `POST`
+- **Headers**: `Content-Type: multipart/form-data`
+- **Body (Multipart Form-Data)**:
+  - `file`: The `.mp4` video file (Required).
+- **Response**: `200 OK`
+  - **Body (JSON)**:
+    ```json
+    {
+      "job_id": "job_<hex_8>",
+      "status": "uploaded"
+    }
+    ```
+- **Error Responses**:
+  - `400 Bad Request`: Only `.mp4` video files are accepted.
+    ```json
+    { "detail": "Only .mp4 video files are accepted." }
+    ```
+  - `500 Internal Server Error`: Server failed to save the uploaded file.
+    ```json
+    { "detail": "Failed to write file on server." }
+    ```
+
+---
+
+## 3. Upload Dataset Zip
+Upload a pre-prepared Nerfstudio ZIP dataset.
+
+- **URL**: `/api/upload/dataset`
+- **Method**: `POST`
+- **Headers**: `Content-Type: multipart/form-data`
+- **Body (Multipart Form-Data)**:
+  - `file`: The `.zip` dataset archive file (Required).
+- **Response**: `200 OK`
+  - **Body (JSON)**:
+    ```json
+    {
+      "job_id": "job_<hex_8>",
+      "status": "uploaded"
+    }
+    ```
+- **Error Responses**:
+  - `400 Bad Request`: File must end in `.zip`.
+    ```json
+    { "detail": "Only .zip files are accepted." }
+    ```
+  - `400 Bad Request`: ZIP lacks required structure (`transforms.json` or images).
+    ```json
+    { "detail": "Dataset zip validation failed (missing transforms.json or images)." }
+    ```
+  - `500 Internal Server Error`: Server extraction failure.
+    ```json
+    { "detail": "Failed to prepare dataset: <error_message>" }
+    ```
+
+---
+
+## 4. List All Jobs
+Get metadata of all existing jobs on the server.
+
+- **URL**: `/api/jobs`
+- **Method**: `GET`
+- **Headers**: `None`
+- **Parameters**: `None`
+- **Response**: `200 OK`
+  - **Body (JSON)**: Array of Job Metadata objects sorted by `created_at` descending.
+    ```json
+    [
+      {
+        "job_id": "job_a1b2c3d4",
+        "job_type": "video", // "video" or "dataset"
+        "source_file": "my_video.mp4",
+        "status": "training", // "uploaded", "preprocessing", "training", "completed", "stopped", "failed"
+        "progress": 45.5, // Float, 0.0 to 100.0
+        "step": 13650, // Current training iteration step
+        "total_steps": 30000, // Total configured steps
+        "loss": 0.02415, // Training loss metric
+        "error_message": "", // Present if status is "failed"
+        "created_at": "2026-07-16T18:00:00.123456",
+        "updated_at": "2026-07-16T18:15:02.987654"
+      }
+    ]
+    ```
+
+---
+
+## 5. Get Job Status and Logs
+Get detailed status and the last 50 log lines for a specific job.
+
+- **URL**: `/api/jobs/{job_id}/status`
+- **Method**: `GET`
+- **Headers**: `None`
+- **Path Parameters**:
+  - `job_id`: Unique identifier of the job (string).
+- **Response**: `200 OK`
+  - **Body (JSON)**:
+    ```json
+    {
+      "metadata": {
+        "job_id": "job_a1b2c3d4",
+        "job_type": "video",
+        "source_file": "my_video.mp4",
+        "status": "training",
+        "progress": 45.5,
+        "step": 13650,
+        "total_steps": 30000,
+        "loss": 0.02415,
+        "error_message": "",
+        "created_at": "2026-07-16T18:00:00.123456",
+        "updated_at": "2026-07-16T18:15:02.987654"
+      },
+      "logs": [
+        "--- STEP 1: Extracting video frames ---",
+        "Extracted 300 frames. Starting COLMAP sparse mapping...",
+        "Colmap step progress...",
+        ...
+      ]
+    }
+    ```
+- **Error Responses**:
+  - `404 Not Found`: Job does not exist.
+    ```json
+    { "detail": "Job not found." }
+    ```
+
+---
+
+## 6. Start Job Training
+Launches or resumes the preprocessing and training pipeline for an uploaded job.
+
+- **URL**: `/api/jobs/{job_id}/start`
+- **Method**: `POST`
+- **Headers**: `Content-Type: application/x-www-form-urlencoded`
+- **Path Parameters**:
+  - `job_id`: Unique identifier of the job (string).
+- **Body (Form Fields)**:
+  - `num_iters`: `int` (Optional. Default: `30000`. Total number of training iterations).
+  - `downscale`: `int` (Optional. Default: `1`. Factor to downscale source images).
+  - `use_cpu`: `bool` (Optional. Default: `false`. True to force CPU training, False for GPU).
+- **Response**: `200 OK`
+  - **Body (JSON)**:
+    ```json
+    {
+      "status": "started"
+    }
+    ```
+- **Error Responses**:
+  - `400 Bad Request`: Job already running or invalid ID.
+    ```json
+    { "detail": "Job could not be started (already running or invalid ID)." }
+    ```
+
+---
+
+## 7. Stop Job
+Stops a currently running job (preprocessing or training status).
+
+- **URL**: `/api/jobs/{job_id}/stop`
+- **Method**: `POST`
+- **Headers**: `None`
+- **Path Parameters**:
+  - `job_id`: Unique identifier of the job (string).
+- **Response**: `200 OK`
+  - **Body (JSON)**:
+    ```json
+    {
+      "status": "stopped"
+    }
+    ```
+- **Error Responses**:
+  - `400 Bad Request`: Job could not be stopped.
+    ```json
+    { "detail": "Job could not be stopped." }
+    ```
+
+---
+
+## 8. Download Model File
+Retrieve the final trained 3D Gaussian Splatting model file.
+
+- **URL**: `/api/jobs/{job_id}/download`
+- **Method**: `GET`
+- **Headers**: `None`
+- **Path Parameters**:
+  - `job_id`: Unique identifier of the job (string).
+- **Query Parameters**:
+  - `format`: `string` (Optional. Default: `"ply"`. Options: `"ply"` or `"splat"`). Specifies output filename suffix.
+- **Response**: `200 OK`
+  - **Body**: Binary File Stream (`application/octet-stream`) containing the PLY model file.
+  - **Headers**: `Content-Disposition: attachment; filename="{job_id}.ply"` (or `{job_id}.splat`)
+- **Error Responses**:
+  - `400 Bad Request`: Training has not finished yet.
+    ```json
+    { "detail": "Model download is not ready. Current job status: <status>" }
+    ```
+  - `404 Not Found`: Job does not exist.
+    ```json
+    { "detail": "Job not found." }
+    ```
+  - `404 Not Found`: PLY file is missing on the server storage.
+    ```json
+    { "detail": "Model file splat.ply not found on server." }
+    ```
+
+---
+
+## 9. Clear Job Logs
+Clears console logs for a specific job.
+
+- **URL**: `/api/jobs/{job_id}/logs`
+- **Method**: `DELETE`
+- **Headers**: `None`
+- **Path Parameters**:
+  - `job_id`: Unique identifier of the job (string).
+- **Response**: `200 OK`
+  - **Body (JSON)**:
+    ```json
+    {
+      "status": "logs_cleared"
+    }
+    ```
+- **Error Responses**:
+  - `404 Not Found`: Job does not exist.
+    ```json
+    { "detail": "Job not found." }
+    ```
+  - `500 Internal Server Error`: Failed to clear file contents on server disk.
+    ```json
+    { "detail": "Failed to clear logs: <error>" }
+    ```
+
+---
+
+## 10. Delete Job
+Stops the job if running and deletes all directory files and metadata from the server.
+
+- **URL**: `/api/jobs/{job_id}`
+- **Method**: `DELETE`
+- **Headers**: `None`
+- **Path Parameters**:
+  - `job_id`: Unique identifier of the job (string).
+- **Response**: `200 OK`
+  - **Body (JSON)**:
+    ```json
+    {
+      "status": "deleted"
+    }
+    ```
+- **Error Responses**:
+  - `404 Not Found`: Job does not exist.
+    ```json
+    { "detail": "Job not found." }
+    ```
+
+---
+
+## 11. System Statistics
+Retrieve live server CPU, RAM, Disk, GPU usage, and active job count.
+
+- **URL**: `/api/system/stats`
+- **Method**: `GET`
+- **Headers**: `None`
+- **Parameters**: `None`
+- **Response**: `200 OK`
+  - **Body (JSON)**:
+    ```json
+    {
+      "cpu": {
+        "percent": 8.4,      // CPU usage percentage
+        "cores": 16          // CPU logical core count
+      },
+      "ram": {
+        "total": 33668874240,     // Total physical RAM in bytes
+        "available": 21849182208, // Available RAM in bytes
+        "used": 11819692032,      // Used RAM in bytes
+        "percent": 35.1           // RAM usage percentage
+      },
+      "disk": {
+        "total": 1024204800000,   // Total disk space in bytes
+        "used": 412495872000,     // Used disk space in bytes
+        "free": 611708928000,     // Free disk space in bytes
+        "percent": 40.3           // Disk usage percentage
+      },
+      "gpu": {
+        "available": true,                    // true if NVIDIA GPU is present and NVML initialized
+        "name": "NVIDIA GeForce RTX 4070 Ti", // GPU Model Name
+        "load": 15.0,                         // GPU core load percentage
+        "memory_used": 1245184000,            // VRAM used in bytes
+        "memory_total": 12884901888,          // VRAM total in bytes
+        "memory_percent": 9.7,                // VRAM percentage
+        "temp": 52                            // GPU Temperature in Celsius
+      },
+      "active_jobs_count": 0 // Total count of jobs currently in preprocessing or training
+    }
+    ```
+
+---
+
+## Job State Machine Flowchart
+
+```
+             [Upload Video]   [Upload Dataset ZIP]
+                   \                 /
+                    v               v
+                +-----------------------+
+                |       uploaded        |
+                +-----------------------+
+                            |
+                            |  [Start Job]
+                            v
+                +-----------------------+
+                |     preprocessing     | <----+ (Resumed)
+                +-----------------------+      |
+                            |                  |
+                            v                  |
+                +-----------------------+      |
+                |       training        | <----+
+                +-----------------------+      |
+                       /    |    \             |
+             (Success)/     |     \(Error)     |
+                     v      |      v           |
+        +-----------+       |       +--------+ |
+        | completed |       |       | failed | |
+        +-----------+       |       +--------+ |
+                            |                  |
+                            | [Stop Job]       |
+                            v                  |
+                        +---------+            |
+                        | stopped | -----------+
+                        +---------+
+```
